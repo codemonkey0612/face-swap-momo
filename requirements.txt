@@ -1,3 +1,8 @@
 opencv-python>=4.8
 mediapipe>=0.10
-numpy>=1.24
+numpy>=1.24,<2.0
+
+# Neural swap backend (optional — needed for --neural flag)
+insightface>=0.7
+onnxruntime-gpu>=1.18  # GPU (CUDA 12.x); swap for onnxruntime if no GPU
+protobuf>=4.25.3,<5    # mediapipe requires <5

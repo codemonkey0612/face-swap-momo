@@ -1,0 +1,36 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "Bash(pip install:*)",
+      "Bash(python -m pip install \"numpy<2.0\" 2>&1 | tail -10)",
+      "Bash(C:/Users/Smile/.pyenv/pyenv-win/versions/3.10.11/python.exe -c \"from onnxruntime.capi import _pybind_state as C; print\\(C.get_available_providers\\(\\)\\)\" 2>&1)",
+      "Bash(C:/Users/Smile/.pyenv/pyenv-win/versions/3.10.11/python.exe -m pip install gfpgan 2>&1 | tail -8)",
+      "Bash(cd \"F:\\\\lancers\\\\Processing\\\\FaceTransformProject\\\\face-swap-momo\" && python -c \"import ast; [ast.parse\\(open\\(f\\).read\\(\\)\\) for f in ['face_swap.py','landmarks.py']]\" && echo \"OK\")",
+      "WebFetch(domain:github.com)",
+      "Bash(gh api repos/facefusion/facefusion-assets/releases --paginate)",
+      "Bash(python -c \" import json, sys data = json.load\\(sys.stdin\\) for release in data: print\\(f''Release: {release[\"\"tag_name\"\"]} - {release[\"\"name\"\"]}''\\) for asset in release.get\\(''assets'', []\\): if ''ghost'' in asset[''name''].lower\\(\\) or ''unet'' in asset[''name''].lower\\(\\): print\\(f'' MATCH: {asset[\"\"name\"\"]} -> {asset[\"\"browser_download_url\"\"]}''\\) \")",
+      "Bash(python -c \":*)",
+      "Bash(gh search code \"ghost_1_2_unet_512\" --repo facefusion/facefusion --limit 10)",
+      "Bash(curl -s \"https://api.github.com/repos/facefusion/facefusion-assets/releases\")",
+      "Bash(python3 -c \":*)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Bash(python -c \"import json,sys; data=json.load\\(sys.stdin\\); [print\\(f''{a[\"\"name\"\"]} -> {a[\"\"browser_download_url\"\"]}''\\) for r in data for a in r.get\\(''assets'',[]\\) if any\\(k in a[''name''].lower\\(\\) for k in [''ghost'',''swap'',''unet'']\\)]\")",
+      "Bash(python -c \"import json,sys; data=json.load\\(sys.stdin\\); [print\\(r[''tag_name''], len\\(r.get\\(''assets'',[]\\)\\)\\) for r in data]\")",
+      "Bash(python -c \"import json,sys; data=json.load\\(sys.stdin\\); [print\\(a[''name'']\\) for r in data for a in r.get\\(''assets'',[]\\) if ''ghost'' in a[''name''].lower\\(\\)]\")",
+      "Bash(curl -s \"https://huggingface.co/api/models/facefusion/models\")",
+      "Bash(python -c \"import json,sys; d=json.load\\(sys.stdin\\); [print\\(s[''rfilename'']\\) for s in d.get\\(''siblings'',[]\\)]\")",
+      "Bash(curl -s \"https://huggingface.co/api/models?search=facefusion+ghost\")",
+      "Bash(python -c \"import json,sys; data=json.load\\(sys.stdin\\); [print\\(m[''modelId'']\\) for m in data]\")",
+      "Bash(curl -s \"https://api.github.com/search/code?q=ghost+repo:facefusion/facefusion+path:face_swapper\" -H \"Accept: application/vnd.github.v3+json\")",
+      "Bash(python -c \"import json,sys; d=json.load\\(sys.stdin\\); [print\\(i[''path'']\\) for i in d.get\\(''items'',[]\\)]\")",
+      "Bash(curl -s \"https://api.github.com/repos/facefusion/facefusion/git/trees/master?recursive=1\")",
+      "Bash(python -c \"import json,sys; d=json.load\\(sys.stdin\\); [print\\(t[''path'']\\) for t in d.get\\(''tree'',[]\\) if ''swap'' in t[''path''].lower\\(\\) and t[''path''].endswith\\(''.py''\\)]\")",
+      "Bash(curl -L -o ghost_3_256.onnx \"https://huggingface.co/facefusion/models-3.0.0/resolve/main/ghost_3_256.onnx\")",
+      "Bash(curl -L -o crossface_ghost.onnx \"https://github.com/facefusion/facefusion-assets/releases/download/models-3.4.0/crossface_ghost.onnx\")",
+      "Bash(curl -L -C - -o ghost_3_256.onnx \"https://huggingface.co/facefusion/models-3.0.0/resolve/main/ghost_3_256.onnx\")",
+      "Bash(.venv/bin/python -c \":*)",
+      "Bash(cd \"F:\\\\lancers\\\\Processing\\\\FaceTransformProject\\\\face-swap-momo\" && python -c \"import ast; [ast.parse\\(open\\(f\\).read\\(\\)\\) for f in ['main.py','neural_swap.py']]\" && echo \"OK\")"
+    ]
+  }
+}

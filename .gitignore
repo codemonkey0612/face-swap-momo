@@ -1,0 +1,22 @@
+# Virtual environment
+.venv/
+
+# Python bytecode
+__pycache__/
+*.pyc
+
+# Models (large binary files)
+models/
+
+# Images (user data)
+images/
+
+# IDE / editor
+.vscode/
+
+# GFPGAN weights
+gfpgan/
+
+# OS
+.DS_Store
+Thumbs.db
