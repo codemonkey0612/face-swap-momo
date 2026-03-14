@@ -30,7 +30,9 @@
       "Bash(curl -L -o crossface_ghost.onnx \"https://github.com/facefusion/facefusion-assets/releases/download/models-3.4.0/crossface_ghost.onnx\")",
       "Bash(curl -L -C - -o ghost_3_256.onnx \"https://huggingface.co/facefusion/models-3.0.0/resolve/main/ghost_3_256.onnx\")",
       "Bash(.venv/bin/python -c \":*)",
-      "Bash(cd \"F:\\\\lancers\\\\Processing\\\\FaceTransformProject\\\\face-swap-momo\" && python -c \"import ast; [ast.parse\\(open\\(f\\).read\\(\\)\\) for f in ['main.py','neural_swap.py']]\" && echo \"OK\")"
+      "Bash(cd \"F:\\\\lancers\\\\Processing\\\\FaceTransformProject\\\\face-swap-momo\" && python -c \"import ast; [ast.parse\\(open\\(f\\).read\\(\\)\\) for f in ['main.py','neural_swap.py']]\" && echo \"OK\")",
+      "Bash(cd \"F:/lancers/Processing/FaceTransformProject/face-swap-momo\" && .venv/bin/python -c \"import onnxruntime as ort; print\\('providers:', ort.get_available_providers\\(\\)\\)\" 2>&1)",
+      "Bash(cd \"F:/lancers/Processing/FaceTransformProject/face-swap-momo\" && .venv/bin/python -c \"import insightface; print\\('insightface OK'\\)\" 2>&1)"
     ]
   }
 }

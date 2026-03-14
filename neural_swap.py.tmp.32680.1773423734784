@@ -442,3 +442,6 @@ class NeuralFaceSwapper:
 
     def swap(self, img, target_face, source_face):
         return self._backend.swap(img, target_face, source_face)
+
+    def swap_bidirectional(self, frame, faces):
+        return self._backend.swap_bidirectional(frame, faces)

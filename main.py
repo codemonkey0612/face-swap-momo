@@ -1,91 +1,64 @@
-"""Real-time face swap pipeline using MediaPipe and OpenCV."""
+"""Real-time face swap pipeline — replaces webcam face with AI source identity."""
 
 import argparse
+import glob
 import os
 import threading
 
 import cv2
 
-from landmarks import create_face_mesh, extract_landmarks
-from face_swap import swap_face, swap_faces_bidirectional, compute_triangles
-from utils import FPSCounter, FreezeFrameManager, LandmarkSmoother, draw_debug_overlay, draw_fps
+from utils import FPSCounter, FreezeFrameManager, draw_fps
 
 
 def parse_args():
     p = argparse.ArgumentParser(description="Real-time face swap")
     p.add_argument("--source", type=str, default=None,
-                   help="Path to source face image. If omitted, swaps two webcam faces.")
-    p.add_argument("--source-dir", type=str, default=None,
-                   help="Folder of source face images — averages all embeddings for "
-                        "a more robust identity (neural mode only).")
+                   help="Path to a single source face image.")
+    p.add_argument("--source-dir", type=str, default="images/1",
+                   help="Folder of source face images — averages all embeddings "
+                        "for a more robust identity.")
     p.add_argument("--camera", type=int, default=0, help="Webcam device index")
     p.add_argument("--width", type=int, default=1280)
     p.add_argument("--height", type=int, default=720)
-    p.add_argument("--no-seamless", action="store_true",
-                   help="Use fast alpha blending instead of seamless clone")
-    p.add_argument("--debug", action="store_true", help="Show landmarks/triangles")
-    p.add_argument("--detect-scale", type=float, default=1.5,
-                   help="Upscale factor for detection (higher = better far-distance detection, slower)")
-    p.add_argument("--neural", action="store_true",
-                   help="Use neural swap (ghost_2_256 or inswapper_128) instead of classical warp")
     p.add_argument("--model", type=str, default="models/ghost_2_256.onnx",
-                   help="Path to swap model (ghost_2_256.onnx recommended, or inswapper_128.onnx)")
+                   help="Path to swap model (ghost_2_256.onnx recommended)")
     p.add_argument("--enhance", action="store_true",
                    help="Run GFPGAN face restoration after each swap (better quality, slower)")
-    p.add_argument("--blend", type=str, default="auto",
-                   choices=["auto", "multiband", "alpha"],
-                   help="Blending mode: auto (seamless→multiband fallback), "
-                        "multiband (Laplacian pyramid), alpha (fast Gaussian)")
+    p.add_argument("--debug", action="store_true", help="Show detection bbox")
     return p.parse_args()
 
 
-def load_source(path, face_mesh):
-    """Load a source face image and extract its landmarks (classical mode)."""
-    img = cv2.imread(path)
-    if img is None:
-        raise FileNotFoundError(f"Cannot read source image: {path}")
-    landmarks = extract_landmarks(img, face_mesh)
-    if not landmarks:
-        raise ValueError(f"No face detected in source image: {path}")
-    return img, landmarks[0]
-
-
-def _init_neural(args):
-    """Initialize the neural swapper and optionally pre-detect the source face."""
-    import glob
-    from neural_swap import NeuralFaceSwapper, build_averaged_face
-    swapper = NeuralFaceSwapper(model_path=args.model)
-    src_face = None
+def _load_source(swapper, args):
+    """Load source identity from --source-dir or --source."""
+    from neural_swap import build_averaged_face
 
     if args.source_dir:
-        # Multi-image averaged embedding (case-insensitive extensions)
         img_exts = ("*.png", "*.jpg", "*.jpeg", "*.bmp", "*.webp",
                     "*.PNG", "*.JPG", "*.JPEG", "*.BMP", "*.WEBP")
         image_paths = []
         for ext in img_exts:
             image_paths.extend(glob.glob(os.path.join(args.source_dir, ext)))
-        # Deduplicate (Windows glob is case-insensitive, Linux is not)
         image_paths = sorted(set(image_paths))
-        image_paths.sort()
         if not image_paths:
             raise FileNotFoundError(f"No images found in: {args.source_dir}")
-        print(f"[MultiSource] Found {len(image_paths)} images in {args.source_dir}")
-        src_face = build_averaged_face(swapper, image_paths)
-    elif args.source:
+        print(f"[Source] Found {len(image_paths)} images in {args.source_dir}")
+        return build_averaged_face(swapper, image_paths)
+
+    if args.source:
         src_img = cv2.imread(args.source)
         if src_img is None:
             raise FileNotFoundError(f"Cannot read source image: {args.source}")
         faces = swapper.detect(src_img)
         if not faces:
             raise ValueError(f"No face detected in source image: {args.source}")
-        src_face = faces[0]
-        print(f"[NeuralSwap] Source face loaded from {args.source}")
+        print(f"[Source] Loaded from {args.source}")
+        return faces[0]
 
-    return swapper, src_face
+    raise ValueError("Provide --source-dir or --source for the AI face identity.")
 
 
 class _AsyncWorker:
-    """Generic single-slot async worker: submits frames, reads latest result without blocking."""
+    """Single-slot async worker: submits frames, reads latest result without blocking."""
 
     def __init__(self, fn):
         self._fn = fn
@@ -132,7 +105,6 @@ class AsyncEnhancer:
         self._worker.submit(frame.copy(), list(faces))
 
     def get(self, fallback):
-        """Return latest enhanced frame, or fallback if not ready yet."""
         result = self._worker.result
         if result is not None:
             with self._lock:
@@ -143,34 +115,22 @@ class AsyncEnhancer:
 
 def main():
     args = parse_args()
-    use_seamless = not args.no_seamless
 
     fps_counter = FPSCounter()
     freeze = FreezeFrameManager()
 
     # --- Enhancer setup ---
-    enhancer = None
     async_enhancer = None
     if args.enhance:
         from enhancer import FaceEnhancer
-        enhancer = FaceEnhancer()
-        async_enhancer = AsyncEnhancer(enhancer)
+        async_enhancer = AsyncEnhancer(FaceEnhancer())
 
-    # --- Neural mode setup ---
-    if args.neural:
-        neural_swapper, src_neural_face = _init_neural(args)
-        face_mesh = None
-        smoother = None
-        src_img = src_landmarks = None
-    else:
-        # --- Classical mode setup ---
-        neural_swapper = src_neural_face = None
-        face_mesh = create_face_mesh(max_faces=2)
-        smoother = LandmarkSmoother(alpha_slow=0.4, alpha_fast=0.8)
-        src_img, src_landmarks = None, None
-        if args.source:
-            src_img, src_landmarks = load_source(args.source, face_mesh)
+    # --- Neural swap setup ---
+    from neural_swap import NeuralFaceSwapper
+    swapper = NeuralFaceSwapper(model_path=args.model)
+    src_face = _load_source(swapper, args)
 
+    # --- Camera ---
     cap = cv2.VideoCapture(args.camera)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
@@ -179,8 +139,7 @@ def main():
         print("Error: Cannot open webcam")
         return
 
-    mode = "neural" if args.neural else "classical"
-    print(f"Press 'q' to quit, 'd' to toggle debug overlay  [mode: {mode}]")
+    print("Press 'q' to quit, 'd' to toggle debug overlay")
     show_debug = args.debug
 
     while True:
@@ -188,81 +147,32 @@ def main():
         if not ret:
             break
 
-        frame = cv2.flip(frame, 1)  # Mirror for natural interaction
+        frame = cv2.flip(frame, 1)
         fps_counter.tick()
         result = frame
 
-        if args.neural:
-            # ---- Neural swap path (synchronous detection for zero-lag tracking) ----
-            cached_faces = neural_swapper.detect(frame)
+        # Detect the first face in the webcam frame
+        detected = swapper.detect(frame)
 
-            if args.source:
-                if cached_faces:
-                    result = neural_swapper.swap(frame, cached_faces[0], src_neural_face)
-                    if async_enhancer:
-                        async_enhancer.submit(result, cached_faces[:1])
-                        result = async_enhancer.get(result)
-                    freeze.update(result)
-                else:
-                    freeze.miss()
-                    frozen = freeze.get_frozen()
-                    result = frozen if frozen is not None else result
-                    cv2.putText(result, "No face detected", (10, 60),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-            else:
-                if len(cached_faces) >= 2:
-                    result = neural_swapper.swap_bidirectional(frame, cached_faces)
-                    if async_enhancer:
-                        async_enhancer.submit(result, cached_faces[:2])
-                        result = async_enhancer.get(result)
-                    freeze.update(result)
-                elif len(cached_faces) == 1:
-                    freeze.miss()
-                    frozen = freeze.get_frozen()
-                    result = frozen if frozen is not None else result
-                    cv2.putText(result, "Need 2 faces", (10, 60),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 165, 255), 2)
-                else:
-                    freeze.miss()
-                    frozen = freeze.get_frozen()
-                    result = frozen if frozen is not None else result
-                    cv2.putText(result, "No face detected", (10, 60),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        if detected:
+            target_face = detected[0]
+            result = swapper.swap(frame, target_face, src_face)
 
+            if async_enhancer:
+                async_enhancer.submit(result, [target_face])
+                result = async_enhancer.get(result)
+
+            freeze.update(result)
+
+            if show_debug:
+                x1, y1, x2, y2 = (int(v) for v in target_face.bbox)
+                cv2.rectangle(result, (x1, y1), (x2, y2), (0, 255, 0), 2)
         else:
-            # ---- Classical swap path ----
-            landmarks_list = smoother.update(extract_landmarks(frame, face_mesh, args.detect_scale))
-
-            if args.source:
-                if landmarks_list:
-                    result = swap_face(
-                        src_img, src_landmarks, frame, landmarks_list[0],
-                        use_seamless=use_seamless,
-                        blend_mode=args.blend,
-                    )
-                    freeze.update(result)
-                else:
-                    freeze.miss()
-                    frozen = freeze.get_frozen()
-                    if frozen is not None:
-                        result = frozen
-            else:
-                if len(landmarks_list) >= 2:
-                    result = swap_faces_bidirectional(
-                        frame, landmarks_list, use_seamless=use_seamless,
-                        blend_mode=args.blend,
-                    )
-                    freeze.update(result)
-                else:
-                    freeze.miss()
-                    frozen = freeze.get_frozen()
-                    if frozen is not None:
-                        result = frozen
-
-            if show_debug and landmarks_list:
-                for lm in landmarks_list:
-                    tris = compute_triangles(lm, frame.shape)
-                    draw_debug_overlay(result, lm, tris)
+            freeze.miss()
+            frozen = freeze.get_frozen()
+            result = frozen if frozen is not None else result
+            cv2.putText(result, "No face detected", (10, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
         draw_fps(result, fps_counter)
         cv2.imshow("Face Swap", result)

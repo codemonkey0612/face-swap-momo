@@ -51,7 +51,7 @@ def _best_providers():
     try:
         import onnxruntime as ort
         available = ort.get_available_providers()
-        for p in ["CUDAExecutionProvider", "CoreMLExecutionProvider"]:
+        for p in ["TensorrtExecutionProvider", "CUDAExecutionProvider", "CoreMLExecutionProvider"]:
             if p in available:
                 return [p, "CPUExecutionProvider"]
     except Exception:
@@ -293,6 +293,13 @@ class _GhostBackend:
         converted_emb = self._convert_embedding(source_face.normed_embedding)
         return self._swap_one(frame, target_face, converted_emb)
 
+    def swap_bidirectional(self, frame, faces):
+        face_a, face_b = faces[0], faces[1]
+        emb_a = self._convert_embedding(face_a.normed_embedding)
+        emb_b = self._convert_embedding(face_b.normed_embedding)
+        result = self._swap_one(frame, face_b, emb_a)
+        result = self._swap_one(result, face_a, emb_b)
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -330,6 +337,14 @@ class _InsightFaceBackend:
         result = frame.copy()
         result = self._swapper.get(result, target_face, source_face, paste_back=True)
         return self._sharpen_bbox(result, target_face)
+
+    def swap_bidirectional(self, frame, faces):
+        face_a, face_b = faces[0], faces[1]
+        result = self._swapper.get(frame.copy(), face_b, face_a, paste_back=True)
+        result = self._sharpen_bbox(result, face_b)
+        result = self._swapper.get(result, face_a, face_b, paste_back=True)
+        result = self._sharpen_bbox(result, face_a)
+        return result
 
 
 # ---------------------------------------------------------------------------
@@ -442,3 +457,6 @@ class NeuralFaceSwapper:
 
     def swap(self, img, target_face, source_face):
         return self._backend.swap(img, target_face, source_face)
+
+    def swap_bidirectional(self, frame, faces):
+        return self._backend.swap_bidirectional(frame, faces)
