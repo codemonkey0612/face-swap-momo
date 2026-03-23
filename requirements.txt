@@ -1,8 +1,40 @@
+# Core
 opencv-python>=4.8
-mediapipe>=0.10
 numpy>=1.24,<2.0
 
-# Neural swap backend (optional — needed for --neural flag)
+# Face detection & analysis
 insightface>=0.7
-onnxruntime-gpu>=1.18  # GPU (CUDA 12.x); swap for onnxruntime if no GPU
-protobuf>=4.25.3,<5    # mediapipe requires <5
+mediapipe>=0.10
+
+# ONNX Runtime (GPU — CUDA 12.x)
+onnxruntime-gpu>=1.18
+
+# Protocol buffers (mediapipe requires <5)
+protobuf>=4.25.3,<5
+
+# Face enhancement
+gfpgan>=1.3.8
+
+# Super resolution (optional — for --enhance + --ultimate)
+realesrgan>=0.3.0
+basicsr>=1.4.2
+
+# CodeFormer (optional — auto-detected at runtime)
+# Install via: pip install codeformer-perceptor
+# Or clone https://github.com/sczhou/CodeFormer and run setup.py
+
+# OBS virtual camera (optional — for --obs)
+pyvirtualcam>=0.11
+
+# Config
+pyyaml>=6.0
+
+# PyTorch (required for GFPGAN, Real-ESRGAN, CodeFormer, MiDaS depth estimation)
+# Install matching your CUDA version:
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+
+# MiDaS / Depth Anything V2 (Layer 5 depth estimation)
+timm>=0.9.12
+
+# Testing
+pytest>=8.0

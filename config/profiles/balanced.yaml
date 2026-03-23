@@ -1,0 +1,29 @@
+# balanced profile — quality/latency trade-off for 25+ FPS target
+# Use when max_quality drops below 20 FPS (e.g. with CodeFormer active)
+
+swap_model: "models/ghost_2_256.onnx"
+detection_confidence_threshold: 0.85
+
+temporal_smoothing_alpha: 0.85
+landmark_ema_alpha: 0.8
+landmark_ema_window: 3
+
+mask_feather_kernel: 31
+mask_feather_sigma: 5.0
+mask_erosion_px: 3
+
+enable_esrgan: false              # Skip ESRGAN — biggest latency saving
+enable_codeformer: false          # Skip CodeFormer — use GFPGAN if needed
+enable_poisson: false             # Alpha blend instead (~100ms savings on 720p)
+enable_lab_color: true
+enable_mouth_exclusion: true
+enable_occlusion: true
+enable_bisenet_mask: true
+
+output_width: 1280
+output_height: 720
+
+boundary:
+  blend_levels: 3             # fewer levels for speed
+  boundary_width: 20          # narrower zone
+  enable_post_refinement: false  # skip Stage 3 (~5ms saving)

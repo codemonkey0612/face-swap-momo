@@ -1,0 +1,36 @@
+# max_quality profile — prioritize visual quality over speed
+# Suitable for RTX 5080 (should still hold 20+ FPS)
+
+swap_model: "models/ghost_3_256.onnx"
+detection_confidence_threshold: 0.7   # Accept more detections
+
+temporal_smoothing_alpha: 0.9         # Stronger temporal smoothing
+landmark_ema_alpha: 0.75              # Slower landmark updates
+
+mask_feather_kernel: 41
+mask_feather_sigma: 7.0
+mask_erosion_px: 2
+
+enable_esrgan: true
+enable_codeformer: true
+enable_poisson: true
+enable_lab_color: true
+enable_mouth_exclusion: true
+enable_occlusion: true
+enable_bisenet_mask: true
+
+output_width: 1920
+output_height: 1080
+
+shape_correction:
+  warp_method: tps            # thin plate spline — smoother than Delaunay
+  temporal_smoothing: 0.8
+  blend_strength: 0.75        # slightly higher for max quality
+
+source_selection:
+  method: blend               # blend top-3 embeddings for smoothest identity interpolation
+
+boundary:
+  blend_levels: 5             # extra pyramid level for smoother transition
+  boundary_width: 40          # wider sampling zone for better color match
+  post_smooth_radius: 7       # wider seam refinement

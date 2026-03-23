@@ -1,0 +1,1353 @@
+"""UltimateSwapPipeline — highest quality real-time face swap for OBS streaming.
+
+Swap engine: Ghost backend (best available for real-time local inference).
+DreamID adapter reserved for when public weights ship — _run_dreamid_swap()
+is the single integration point.
+
+Per-frame pipeline (in exact order):
+  1.  Detect face (InsightFace RetinaFace) + 468 landmarks (MediaPipe Face Mesh)
+  2.  Confidence gate → failsafe if < 0.85
+  3.  Temporal landmark EMA (α=0.8, 5-frame window)
+  4.  Affine-align face to 256×256 canonical space
+  5.  BiSeNet-FP segmentation mask (aligned space)
+  6.  Exclude mouth via MediaPipe lip contour indices 61-291, 8px feather
+  7.  Gaussian feathering (31×31, σ=5) — INWARD ONLY (never expands past boundary)
+  8.  Face Dragon frame-space occluder detection → subtract from mask
+  9.  Ghost face swap at 256×256  (DreamID slot)
+  10. Real-ESRGAN upscale (4×, optional)
+  11. Warp back to frame space
+  12. Lab color histogram matching (L, A, B per-channel mean+std)
+  13. Poisson seamless clone composite (NORMAL_CLONE)
+  14. CodeFormer / GFPGAN face enhancement
+  15. Hard-paste original mouth pixels
+  16. Temporal output smoothing (0.85 current + 0.15 previous)
+
+Occlusion (Face Dragon technique):
+  BiSeNet on ORIGINAL frame crop detects hands/objects as they really appear
+  (not distorted by affine warp).  Occluder pixels are subtracted from the
+  swap mask — objects sit naturally ON TOP of the transformed face.
+
+Failsafe:
+  30-frame circular buffer → freeze → 10-frame fade-to-black → 5-frame fade-in.
+  All triggers logged to failsafe.log with timestamps.
+"""
+
+import logging
+import os
+import time
+import urllib.request
+from collections import deque
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
+
+import cv2
+import numpy as np
+
+from neural_swap import (
+    FaceParser,
+    NeuralFaceSwapper,
+    OcclusionDetector,
+    _align_face,
+    _best_providers,
+    _detect_frame_occluders,
+    _sharpen,
+)
+
+# XSeg face occluder — purpose-trained aligned-space model (v2 occlusion fix)
+try:
+    from src.occlusion.face_occluder import FaceOccluder
+    _FACE_OCCLUDER_AVAILABLE = True
+except ImportError:
+    FaceOccluder = None  # type: ignore
+    _FACE_OCCLUDER_AVAILABLE = False
+
+# Face shape adapter — landmark-guided shape blending
+try:
+    from src.shape.face_shape_adapter import FaceShapeAdapter
+    _SHAPE_ADAPTER_AVAILABLE = True
+except ImportError:
+    FaceShapeAdapter = None  # type: ignore
+    _SHAPE_ADAPTER_AVAILABLE = False
+
+# Boundary seam fixer — three-stage seamless compositing
+try:
+    from src.compositing.boundary_seam_fixer import BoundarySeamFixer
+    _BOUNDARY_FIXER_AVAILABLE = True
+except ImportError:
+    BoundarySeamFixer = None  # type: ignore
+    _BOUNDARY_FIXER_AVAILABLE = False
+
+# Eye region fixer — CodeFormer restoration + orbital color match + blend
+try:
+    from src.enhancement.eye_region_fixer import EyeRegionFixer
+    _EYE_FIXER_AVAILABLE = True
+except ImportError:
+    EyeRegionFixer = None  # type: ignore
+    _EYE_FIXER_AVAILABLE = False
+
+# Multi-reference source face selector
+try:
+    from src.swap.source_face_selector import SourceFaceSelector
+    _SELECTOR_AVAILABLE = True
+except ImportError:
+    SourceFaceSelector = None  # type: ignore
+    _SELECTOR_AVAILABLE = False
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+# MediaPipe Face Mesh outer lip contour (clockwise from left corner)
+OUTER_LIP_INDICES: List[int] = [
+    61, 146, 91, 181, 84, 17, 314, 405, 321, 375,
+    291, 409, 270, 269, 267, 0, 37, 39, 40, 185,
+]
+
+_CODEFORMER_URL = "https://github.com/sczhou/CodeFormer/releases/download/v0.1.0/codeformer.pth"
+_ESRGAN_URL = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth"
+_ESRGAN_ANIME_URL = (
+    "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.2.4/"
+    "RealESRGAN_x4plus_anime_6B.pth"
+)
+
+# Failsafe logger
+_fs_log = logging.getLogger("failsafe")
+if not _fs_log.handlers:
+    _fh = logging.FileHandler("failsafe.log", encoding="utf-8")
+    _fh.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+    _fs_log.addHandler(_fh)
+    _fs_log.setLevel(logging.INFO)
+
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PipelineConfig:
+    source_image_path: str = ""
+    swap_model: str = "models/ghost_3_256.onnx"
+    detection_confidence_threshold: float = 0.85
+    codeformer_fidelity: float = 0.75
+    temporal_smoothing_alpha: float = 0.85
+    landmark_ema_alpha: float = 0.8
+    landmark_ema_window: int = 5
+    mouth_feather_px: int = 8
+    occlusion_threshold: int = 15
+    face_type: str = "realistic"
+    output_width: int = 1920
+    output_height: int = 1080
+    obs_virtual_camera: bool = True
+    failsafe_freeze_seconds: float = 2.0
+    failsafe_buffer_size: int = 30
+    failsafe_fade_out_frames: int = 10
+    failsafe_fade_in_frames: int = 5
+    mask_feather_kernel: int = 31
+    mask_feather_sigma: float = 5.0
+    mask_erosion_px: int = 5
+    # XSeg occlusion model (v2 — replaces 5-layer system)
+    xseg_model: str = ""                  # auto-discovered from models/ if empty
+    xseg_threshold: float = 0.5          # mask binarisation threshold
+    xseg_blur_sigma: float = 5.0         # edge feathering sigma
+    # Shape correction
+    enable_shape_correction: bool = True
+    shape_blend_strength: float = 0.7    # 0=off, 1=full match to performer
+    shape_inner_radius: float = 0.3      # identity zone (center, no warp)
+    shape_outer_radius: float = 0.85     # full blend zone (jawline area)
+    shape_warp_method: str = "delaunay"  # 'delaunay' (fast) or 'tps' (quality)
+    shape_temporal_smoothing: float = 0.7
+    shape_jawline_blend: float = 0.9
+    shape_eye_blend: float = 0.15
+    shape_nose_blend: float = 0.10
+    shape_mouth_blend: float = 0.10
+    shape_landmark_model: str = ""       # path to ONNX 68-pt model (auto-discovered)
+    # Multi-reference source face selector
+    source_selection_enabled: bool = True
+    source_selection_method: str = "select"   # 'select' or 'blend'
+    source_pose_weight: float = 3.0
+    source_temperature_weight: float = 2.0
+    source_direction_weight: float = 1.5
+    source_luminance_weight: float = 1.0
+    source_switch_threshold: float = 0.15
+    source_switch_delay_frames: int = 5
+    # Boundary seam fixer
+    enable_boundary_fix: bool = True
+    boundary_color_match_strength: float = 0.8
+    boundary_blend_levels: int = 4
+    boundary_width: int = 30
+    boundary_post_smooth_radius: int = 5
+    boundary_enable_color_transfer: bool = True
+    boundary_enable_multiband: bool = True
+    boundary_enable_post_refinement: bool = True
+    # Feature toggles
+    enable_esrgan: bool = False           # Heavy (500ms+) — enable with --enhance
+    enable_codeformer: bool = False       # Heavy (300ms+) — enable with --enhance
+    enable_poisson: bool = False          # ~50-150ms on 1080p; enable with quality mode
+    enable_lab_color: bool = True
+    enable_mouth_exclusion: bool = True
+    enable_temporal_smooth: bool = True
+    enable_occlusion: bool = True
+    enable_bisenet_mask: bool = True
+    occlusion_check_interval: int = 3     # Cache interval kept for compat (XSeg runs every frame)
+    # Eye region fixer
+    enable_eye_fix: bool = True
+    eye_fix_restore_model: str = "codeformer"       # 'codeformer' or 'gfpgan'
+    eye_fix_restore_strength: float = 0.6            # CodeFormer fidelity 0.0-1.0
+    eye_fix_apply_to: str = "eyes_only"              # 'eyes_only' or 'full_face'
+    eye_fix_upscale_before_restore: bool = True
+    eye_fix_orbital_color_match: bool = True
+    eye_fix_orbital_color_strength: float = 0.7
+    eye_fix_sclera_correction: bool = True
+    eye_fix_orbital_blend: bool = True
+
+
+# ---------------------------------------------------------------------------
+# Data types
+# ---------------------------------------------------------------------------
+
+class DiagnosticsDict(dict):
+    """Keys: stage_latencies, detection_confidence, occlusion_map,
+    failsafe_state, frame_number, fps."""
+    pass
+
+
+@dataclass
+class FaceDetection:
+    bbox: np.ndarray
+    kps: np.ndarray              # 5-point InsightFace
+    confidence: float
+    embedding: np.ndarray
+    mesh_landmarks: Optional[np.ndarray] = None  # 468×3 MediaPipe
+    face_object: Any = None
+
+
+# ---------------------------------------------------------------------------
+# Failsafe
+# ---------------------------------------------------------------------------
+
+class FailsafeManager:
+    """Circular buffer + freeze + fade-to-black + fade-in."""
+
+    def __init__(self, cfg: PipelineConfig, fps_est: float = 30.0):
+        self._buf: deque = deque(maxlen=cfg.failsafe_buffer_size)
+        self._freeze_limit = int(cfg.failsafe_freeze_seconds * fps_est)
+        self._fade_out_n = cfg.failsafe_fade_out_frames
+        self._fade_in_n = cfg.failsafe_fade_in_frames
+        self._miss = 0
+        self._returning = False
+        self._return_cnt = 0
+        self.state = "INACTIVE"
+
+    def push_clean(self, frame: np.ndarray) -> None:
+        self._buf.append(frame.copy())
+        if self._returning:
+            self._return_cnt += 1
+            if self._return_cnt >= self._fade_in_n:
+                self._returning = False
+                self._return_cnt = 0
+                self.state = "INACTIVE"
+        self._miss = 0
+
+    def on_miss(self) -> None:
+        if self._miss == 0:
+            self.state = "FREEZE"
+            _fs_log.info("FREEZE — face lost")
+        self._miss += 1
+        if self._miss > self._freeze_limit:
+            self.state = "FADE_BLACK"
+
+    def on_return(self) -> None:
+        if self._miss > 0:
+            self._returning = True
+            self._return_cnt = 0
+            self.state = "FADE_IN"
+            _fs_log.info("FADE_IN — face returned")
+
+    def get_frame(self, current: Optional[np.ndarray] = None) -> np.ndarray:
+        if self.state == "INACTIVE" and current is not None:
+            return current
+        if self.state == "FADE_IN" and current is not None:
+            t = min(1.0, self._return_cnt / max(1, self._fade_in_n))
+            frozen = self._buf[-1] if self._buf else current
+            return cv2.addWeighted(current, t, frozen, 1.0 - t, 0)
+        if self.state == "FADE_BLACK":
+            if not self._buf:
+                return np.zeros_like(current) if current is not None else np.zeros((1080, 1920, 3), dtype=np.uint8)
+            base = self._buf[-1]
+            t = min(1.0, (self._miss - self._freeze_limit) / max(1, self._fade_out_n))
+            return cv2.addWeighted(base, 1.0 - t, np.zeros_like(base), t, 0)
+        # FREEZE
+        if self._buf:
+            return self._buf[-1]
+        return current if current is not None else np.zeros((1080, 1920, 3), dtype=np.uint8)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+class _T:
+    """Lightweight timer context manager."""
+    def __init__(self, name: str, store: dict):
+        self._n = name; self._s = store
+    def __enter__(self):
+        self._t = time.perf_counter(); return self
+    def __exit__(self, *_):
+        self._s[self._n] = (time.perf_counter() - self._t) * 1000.0; return False
+
+
+def _ensure_model(url: str, path: str) -> str:
+    if os.path.exists(path):
+        return path
+    os.makedirs(os.path.dirname(path) or "models", exist_ok=True)
+    print(f"[Download] {os.path.basename(path)} ...")
+    urllib.request.urlretrieve(url, path)
+    print(f"[Download] → {path}")
+    return path
+
+
+def _inward_feather(mask: np.ndarray, ksize: int, sigma: float) -> np.ndarray:
+    """Gaussian blur for soft edges, clamped to never expand past original boundary.
+
+    This is the core fix for the ghost-face-over-object problem:
+    standard blur EXPANDS the mask outward, leaking swapped pixels onto
+    occluding objects.  Inward-only blur creates soft edges only INSIDE
+    the mask boundary.
+    """
+    boundary = (mask > 0.01).astype(np.float32)
+    k = ksize | 1  # ensure odd
+    blurred = cv2.GaussianBlur(mask, (k, k), sigma)
+    return np.minimum(blurred, boundary)
+
+
+def _inward_feather_aniso(mask: np.ndarray,
+                          ksize_h: int, ksize_v: int,
+                          sigma: float) -> np.ndarray:
+    """Anisotropic inward-only Gaussian feather.
+
+    Uses a wider horizontal kernel so the transition zone at the sides is
+    softer than at the forehead/chin.  This compensates for the width
+    mismatch between source and target faces: the wider horizontal gradient
+    distributes the blend over more pixels, hiding any residual seam.
+
+    Both axes are clamped to the original mask boundary so the swap never
+    leaks outside the face region.
+    """
+    boundary = (mask > 0.01).astype(np.float32)
+    kh = ksize_h | 1  # horizontal kernel — wider
+    kv = ksize_v | 1  # vertical kernel  — narrower
+    # Two-pass separable Gaussian: horizontal first, then vertical.
+    # ksize=(kh, 1) = pure horizontal 1-D Gaussian;
+    # ksize=(1, kv) = pure vertical 1-D Gaussian.
+    blurred = cv2.GaussianBlur(mask, (kh, 1), sigma)   # horizontal pass
+    blurred = cv2.GaussianBlur(blurred, (1, kv), sigma) # vertical pass
+    return np.minimum(blurred, boundary)
+
+
+# ---------------------------------------------------------------------------
+# UltimateSwapPipeline
+# ---------------------------------------------------------------------------
+
+class UltimateSwapPipeline:
+
+    def __init__(self, source_image_path: str, config: PipelineConfig):
+        self._cfg = config
+        self._timings: Dict[str, float] = {}
+        self._frame_num = 0
+        self._fps_times: deque = deque(maxlen=60)
+        self._prev_frame: Optional[np.ndarray] = None
+        self._lm_buf: deque = deque(maxlen=config.landmark_ema_window)
+        self._last_conf = 0.0
+        # Cached pre-swap occluder (reused between occlusion_check_interval frames)
+        self._last_occluder: Optional[np.ndarray] = None
+        self._last_occ_mask_frame: Optional[np.ndarray] = None
+        # Previous swap mask — used by temporal smooth to detect occlusion changes
+        self._prev_swap_mask: Optional[np.ndarray] = None
+
+        # --- Swap engine ---
+        self._swapper = NeuralFaceSwapper(model_path=config.swap_model, occlusion=False)
+        self._backend = self._swapper._backend
+        self._is_ghost = hasattr(self._backend, "_convert_embedding")
+        self._swap_size = self._backend._size if self._is_ghost else 128
+
+        # --- Source identity: single image OR multi-variant directory ---
+        # If source_image_path is a directory and selection is enabled,
+        # load a SourceFaceSelector; otherwise fall back to the static embedding.
+        self._selector: Optional["SourceFaceSelector"] = None  # type: ignore[name-defined]
+
+        if (config.source_selection_enabled
+                and _SELECTOR_AVAILABLE
+                and os.path.isdir(source_image_path)):
+            try:
+                convert_fn = self._backend._convert_embedding if self._is_ghost else None
+                self._selector = SourceFaceSelector(
+                    self._swapper,
+                    {
+                        "source_face_dir":      source_image_path,
+                        "method":               config.source_selection_method,
+                        "pose_weight":          config.source_pose_weight,
+                        "temperature_weight":   config.source_temperature_weight,
+                        "direction_weight":     config.source_direction_weight,
+                        "luminance_weight":     config.source_luminance_weight,
+                        "switch_threshold":     config.source_switch_threshold,
+                        "switch_delay_frames":  config.source_switch_delay_frames,
+                    },
+                )
+                self._selector_convert_fn = convert_fn
+                # Set a default static embedding from the first variant
+                first_emb = self._selector.variants[0].embedding
+                self._src_emb = convert_fn(first_emb) if convert_fn else first_emb
+                print(f"[Pipeline] Multi-variant mode — {len(self._selector.variants)} variants")
+            except Exception as e:
+                print(f"[Pipeline] SourceFaceSelector failed: {e} — single-file fallback")
+                self._selector = None
+                self._src_emb = self._cache_source(source_image_path)
+        else:
+            # Single file (or directory mode disabled)
+            if os.path.isdir(source_image_path):
+                # Directory but selector disabled — pick first image
+                import glob as _glob
+                imgs = sorted(_glob.glob(os.path.join(source_image_path, "*.png")) +
+                              _glob.glob(os.path.join(source_image_path, "*.jpg")))
+                src_path = imgs[0] if imgs else source_image_path
+            else:
+                src_path = source_image_path
+            self._src_emb = self._cache_source(src_path)
+            self._selector_convert_fn = None
+
+        # --- BiSeNet face parser ---
+        # NeuralFaceSwapper(occlusion=False) does NOT load the parser,
+        # so we must load it independently for the pipeline's own masking.
+        self._parser: Optional[FaceParser] = self._swapper.face_parser
+        if self._parser is None:
+            model_dir = os.path.dirname(config.swap_model) or "models"
+            for name in ("face_parser.onnx", "bisenet_resnet_34.onnx", "bisenet_fp.onnx"):
+                parser_path = os.path.join(model_dir, name)
+                if os.path.exists(parser_path):
+                    self._parser = FaceParser(parser_path, _best_providers())
+                    break
+
+        # --- XSeg face occluder (v2 — replaces entire 5-layer system) ---
+        # XSeg is a purpose-trained model that runs on the ALIGNED 256×256 crop.
+        # It distinguishes face-skin from hand-skin using learned context,
+        # which all general-purpose methods (BiSeNet, MediaPipe, depth) cannot do.
+        # Running in aligned space means zero coordinate mismatch with the swap model.
+        self._xseg: Optional["FaceOccluder"] = None  # type: ignore[name-defined]
+        if config.enable_occlusion and _FACE_OCCLUDER_AVAILABLE:
+            model_dir = os.path.dirname(config.swap_model) or "models"
+            xseg_path = config.xseg_model or (FaceOccluder.find_model(model_dir) if FaceOccluder else None)
+            if xseg_path and os.path.exists(xseg_path):
+                try:
+                    self._xseg = FaceOccluder(xseg_path, _best_providers())
+                except Exception as e:
+                    print(f"[Pipeline] XSeg load failed: {e} — falling back to BiSeNet masking")
+            else:
+                print("[Pipeline] No XSeg model found in models/ — download xseg_2.onnx")
+                print("[Pipeline]   Falling back to BiSeNet + ellipse masking (no hand occlusion)")
+
+        # --- Legacy OcclusionDetector (frame-space, kept as reference but not called) ---
+        self._occ_detector: Optional[OcclusionDetector] = None  # kept for compat
+
+        # --- Face shape adapter ---
+        self._shape_adapter = None
+        if config.enable_shape_correction and _SHAPE_ADAPTER_AVAILABLE:
+            try:
+                self._shape_adapter = FaceShapeAdapter({
+                    "blend_strength":     config.shape_blend_strength,
+                    "inner_radius":       config.shape_inner_radius,
+                    "outer_radius":       config.shape_outer_radius,
+                    "warp_method":        config.shape_warp_method,
+                    "temporal_smoothing": config.shape_temporal_smoothing,
+                    "jawline_blend":      config.shape_jawline_blend,
+                    "eye_blend":          config.shape_eye_blend,
+                    "nose_blend":         config.shape_nose_blend,
+                    "mouth_blend":        config.shape_mouth_blend,
+                    "landmark_model":     config.shape_landmark_model,
+                })
+                print(f"[Pipeline] FaceShapeAdapter ready — "
+                      f"blend={config.shape_blend_strength}  "
+                      f"method={config.shape_warp_method}")
+            except Exception as e:
+                print(f"[Pipeline] FaceShapeAdapter init failed: {e} — shape correction disabled")
+        elif not _SHAPE_ADAPTER_AVAILABLE:
+            print("[Pipeline] scipy not installed — shape correction disabled (pip install scipy)")
+
+        # --- Boundary seam fixer ---
+        self._boundary_fixer = None
+        if config.enable_boundary_fix and _BOUNDARY_FIXER_AVAILABLE:
+            try:
+                self._boundary_fixer = BoundarySeamFixer({
+                    "color_match_strength":   config.boundary_color_match_strength,
+                    "blend_levels":           config.boundary_blend_levels,
+                    "boundary_width":         config.boundary_width,
+                    "post_smooth_radius":     config.boundary_post_smooth_radius,
+                    "enable_color_transfer":  config.boundary_enable_color_transfer,
+                    "enable_multiband":       config.boundary_enable_multiband,
+                    "enable_post_refinement": config.boundary_enable_post_refinement,
+                })
+                stages = []
+                if config.boundary_enable_color_transfer:  stages.append("ColorHarm")
+                if config.boundary_enable_multiband:       stages.append(f"MultiBand(L={config.boundary_blend_levels})")
+                if config.boundary_enable_post_refinement: stages.append("Refine")
+                print(f"[Pipeline] BoundarySeamFixer ready — {'+'.join(stages)}")
+            except Exception as e:
+                print(f"[Pipeline] BoundarySeamFixer init failed: {e} — using alpha blend")
+
+        # --- Eye region fixer ---
+        self._eye_fixer = None
+        if config.enable_eye_fix and _EYE_FIXER_AVAILABLE:
+            try:
+                self._eye_fixer = EyeRegionFixer(
+                    {
+                        "restore_model":          config.eye_fix_restore_model,
+                        "restore_strength":       config.eye_fix_restore_strength,
+                        "apply_to":               config.eye_fix_apply_to,
+                        "upscale_before_restore": config.eye_fix_upscale_before_restore,
+                        "orbital_color_match":    config.eye_fix_orbital_color_match,
+                        "orbital_color_strength": config.eye_fix_orbital_color_strength,
+                        "sclera_correction":      config.eye_fix_sclera_correction,
+                        "orbital_blend":          config.eye_fix_orbital_blend,
+                    },
+                    face_parser=self._parser,
+                )
+                print(f"[Pipeline] EyeRegionFixer ready — "
+                      f"restore={config.eye_fix_restore_strength}  "
+                      f"apply={config.eye_fix_apply_to}")
+            except Exception as e:
+                print(f"[Pipeline] EyeRegionFixer init failed: {e}")
+
+        # --- MediaPipe Face Mesh ---
+        self._mesh = None
+        if config.enable_mouth_exclusion:
+            try:
+                import mediapipe as mp
+                self._mesh = mp.solutions.face_mesh.FaceMesh(
+                    static_image_mode=False, max_num_faces=1,
+                    refine_landmarks=False,  # True adds ~400ms; we only need lip contour
+                    min_detection_confidence=0.5, min_tracking_confidence=0.5,
+                )
+                print("[Pipeline] MediaPipe Face Mesh loaded")
+            except ImportError:
+                print("[Pipeline] mediapipe not installed — mouth exclusion disabled")
+
+        # --- Real-ESRGAN ---
+        self._upsampler = None
+        if config.enable_esrgan:
+            self._init_esrgan()
+
+        # --- CodeFormer / GFPGAN ---
+        self._cf_net = None
+        self._cf_device = "cpu"
+        self._gfpgan = None
+        if config.enable_codeformer:
+            self._init_enhancer()
+
+        # --- Failsafe ---
+        self._failsafe = FailsafeManager(config)
+        self._last_good_det: Optional[FaceDetection] = None
+        self._no_face_count = 0
+        self._grace_frames = 10  # ~333ms at 30fps before freeze
+
+        # --- Print feature summary ---
+        feats = []
+        if self._parser:       feats.append("BiSeNet")
+        if self._mesh:         feats.append("MouthExcl")
+        if self._xseg:         feats.append("XSeg-Occ")
+        elif self._parser:     feats.append("BiSeNet-Occ(fallback)")
+        if self._upsampler:    feats.append("ESRGAN")
+        if self._cf_net:       feats.append("CodeFormer")
+        elif self._gfpgan:     feats.append("GFPGAN")
+        if config.enable_poisson:    feats.append("Poisson")
+        if config.enable_lab_color:  feats.append("LabColor")
+        if config.enable_temporal_smooth: feats.append("Temporal")
+        if self._selector:           feats.append(f"MultiRef({config.source_selection_method},{len(self._selector.variants)}v)")
+        if self._shape_adapter:      feats.append(f"ShapeAdapt({config.shape_warp_method})")
+        if self._boundary_fixer:     feats.append("BoundaryFix")
+        occ_status = "XSeg" if self._xseg else ("BiSeNet-fallback" if self._parser else "ellipse-only")
+        print(f"[Pipeline] Ready — swap={self._swap_size}px  occlusion={occ_status}  features={', '.join(feats)}")
+
+    # ------------------------------------------------------------------
+    # Init helpers
+    # ------------------------------------------------------------------
+
+    def _cache_source(self, path: str) -> np.ndarray:
+        if not path or not os.path.exists(path):
+            raise FileNotFoundError(f"Source image not found: {path}")
+        img = cv2.imread(path)
+        if img is None:
+            raise ValueError(f"Cannot read: {path}")
+        faces = self._swapper.detect(img)
+        if not faces:
+            raise ValueError(f"No face in source: {path}")
+        emb = faces[0].normed_embedding
+        if self._is_ghost:
+            return self._backend._convert_embedding(emb)
+        return emb
+
+    def _init_esrgan(self) -> None:
+        try:
+            import torch
+            from basicsr.archs.rrdbnet_arch import RRDBNet
+            from realesrgan import RealESRGANer
+
+            if self._cfg.face_type == "anime":
+                net = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=6, num_grow_ch=32, scale=4)
+                url, name = _ESRGAN_ANIME_URL, "RealESRGAN_x4plus_anime_6B.pth"
+            else:
+                net = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4)
+                url, name = _ESRGAN_URL, "RealESRGAN_x4plus.pth"
+            mp = _ensure_model(url, f"models/{name}")
+            dev = "cuda" if torch.cuda.is_available() else "cpu"
+            self._upsampler = RealESRGANer(
+                scale=4, model_path=mp, model=net,
+                tile=0, tile_pad=10, pre_pad=0,
+                half=(dev == "cuda"), device=torch.device(dev),
+            )
+            print(f"[Pipeline] Real-ESRGAN ({name}) on {dev}")
+        except Exception as e:
+            print(f"[Pipeline] ESRGAN unavailable: {e}")
+
+    def _init_enhancer(self) -> None:
+        # Try CodeFormer
+        try:
+            import torch
+            CF = None
+            for mod in ("codeformer.basicsr.archs.codeformer_arch",
+                        "basicsr.archs.codeformer_arch"):
+                try:
+                    m = __import__(mod, fromlist=["CodeFormer"])
+                    CF = getattr(m, "CodeFormer"); break
+                except (ImportError, AttributeError):
+                    continue
+            if CF is None:
+                raise ImportError("CodeFormer arch not found")
+            net = CF(dim_embd=512, codebook_size=1024, n_head=8, n_layers=9,
+                     connect_list=["32", "64", "128", "256"])
+            ckpt = _ensure_model(_CODEFORMER_URL, "models/codeformer.pth")
+            dev = "cuda" if torch.cuda.is_available() else "cpu"
+            state = torch.load(ckpt, map_location=dev, weights_only=False)
+            net.load_state_dict(state.get("params_ema", state))
+            net.eval().to(dev)
+            self._cf_net = net
+            self._cf_device = dev
+            print(f"[Pipeline] CodeFormer (w={self._cfg.codeformer_fidelity}) on {dev}")
+            return
+        except Exception as e:
+            print(f"[Pipeline] CodeFormer unavailable ({e})")
+
+        # Fallback: GFPGAN
+        try:
+            import torch
+            from gfpgan import GFPGANer
+            gp = "models/GFPGANv1.4.pth"
+            if not os.path.exists(gp):
+                return
+            dev = "cuda" if torch.cuda.is_available() else "cpu"
+            self._gfpgan = GFPGANer(
+                model_path=gp, upscale=1, arch="clean",
+                channel_multiplier=2, bg_upsampler=None,
+                device=torch.device(dev),
+            )
+            print(f"[Pipeline] GFPGAN on {dev} (CodeFormer fallback)")
+        except Exception as e:
+            print(f"[Pipeline] No enhancer: {e}")
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def process_frame(self, frame: np.ndarray) -> np.ndarray:
+        """Per-frame pipeline (v2 — XSeg aligned-space occlusion).
+
+        All masking is done in aligned 256×256 space where XSeg, BiSeNet,
+        the face ellipse, and the swap model share the same pixel grid.
+        There is zero coordinate mismatch and zero alignment error.
+
+        Order:
+          1  Detect face
+          2  Smooth landmarks
+          3  Align to 256×256 canonical crop
+          4  XSeg occlusion mask (aligned space — 1=face, 0=occluder)
+          5  BiSeNet refinement (optional — constrains to inner face classes)
+          6  Mouth exclusion
+          7  Anisotropic erosion (sides > top/bottom for width-mismatch fix)
+          8  Anisotropic feathering (horizontal kernel 2× wider)
+          9  Face swap (in aligned space)
+         10  ALIGNED-SPACE COMPOSITE (ghost-killer — occluder pixels already correct)
+         11  ESRGAN upscale of the composited crop
+         12  Warp composited crop + face ellipse back to frame space
+         13  Lab colour transfer
+         14  Boundary spill fix
+         15  Final composite into pristine (face ellipse as outer boundary)
+         16  Enhancement (CodeFormer / GFPGAN)
+         17  Restore mouth
+         18  Temporal smooth with occlusion-aware buffer flush
+        """
+        self._timings.clear()
+        self._frame_num += 1
+        self._fps_times.append(time.perf_counter())
+
+        # Always composite against the untouched original frame.
+        pristine = frame.copy()
+
+        # 1. Detect
+        with _T("detect", self._timings):
+            det = self._detect_face(frame)
+
+        if det is not None:
+            self._no_face_count = 0
+            self._last_good_det = det
+            self._failsafe.on_return()
+        elif self._last_good_det is not None and self._no_face_count < self._grace_frames:
+            det = self._last_good_det
+            self._no_face_count += 1
+        else:
+            self._no_face_count += 1
+            self._failsafe.on_miss()
+            return self._failsafe.get_frame(frame)
+
+        # 2. Smooth landmarks
+        with _T("lm_smooth", self._timings):
+            kps = self._smooth_landmarks(det.kps)
+
+        # 3. Align to canonical swap_size × swap_size crop
+        with _T("align", self._timings):
+            aligned, M = _align_face(frame, kps, self._swap_size)
+
+        # ════════════════════════════════════════════════════════════════════
+        # ALL MASKING IN ALIGNED SPACE
+        #
+        # Key insight: XSeg, BiSeNet, the swap model, and the face ellipse
+        # all operate on the SAME 256×256 pixel grid.  There is no warping of
+        # a frame-space mask into aligned space — the mask IS in aligned space.
+        #
+        # The aligned 'crop' contains the occluder (hand, cup, phone) exactly
+        # as it appears in the canonical aligned view.  XSeg was trained on
+        # exactly this kind of input and knows the contextual difference
+        # between face-skin and hand-skin that frame-space models cannot see.
+        # ════════════════════════════════════════════════════════════════════
+
+        # Soft face ellipse — defines the outer swap boundary (not occlusion-aware)
+        face_ellipse = self._make_face_ellipse(self._swap_size)
+
+        # 4. XSeg occlusion mask in aligned space
+        #    1.0 = face (safe to swap), 0.0 = occluder (preserve original)
+        with _T("xseg", self._timings):
+            if self._xseg is not None and self._cfg.enable_occlusion:
+                occ_mask = self._xseg.create_occlusion_mask(aligned)
+            else:
+                # No XSeg: full face is considered unoccluded
+                occ_mask = np.ones((self._swap_size, self._swap_size), dtype=np.float32)
+
+        # 5. BiSeNet refinement (optional)
+        #    Constrains the swap region to INNER face classes (skin, brows, eyes,
+        #    nose, lips) rather than the full ellipse.  BiSeNet is NOT used for
+        #    occlusion here — XSeg owns that.  BiSeNet adds semantic precision.
+        with _T("bisenet", self._timings):
+            if self._parser is not None and self._cfg.enable_bisenet_mask:
+                inner = self._parser.parse_aligned(aligned)
+                combined = face_ellipse * occ_mask * inner
+            else:
+                combined = face_ellipse * occ_mask
+
+        # 6. Mouth exclusion (aligned space)
+        with _T("mouth_excl", self._timings):
+            combined = self._exclude_mouth_region(combined, det.mesh_landmarks, M)
+
+        # 7. Anisotropic erosion — sides erode more than top/bottom to compensate
+        #    for source/target face-width mismatch seam.
+        if self._cfg.mask_erosion_px > 0:
+            e = self._cfg.mask_erosion_px
+            kw = max(3, e * 2 + 1) | 1   # horizontal — full erosion
+            kh = max(3, e * 2 - 1) | 1   # vertical   — 1 px less
+            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kw, kh))
+            combined = cv2.erode((combined * 255).astype(np.uint8), k).astype(np.float32) / 255.0
+
+        # 8. Anisotropic inward-only feathering
+        with _T("feather", self._timings):
+            k_cfg = self._cfg.mask_feather_kernel
+            k_v = max(7, k_cfg // 2) | 1
+            combined = _inward_feather_aniso(combined, k_cfg, k_v, self._cfg.mask_feather_sigma)
+
+        # 9. Swap (in aligned space — output is swap_size × swap_size)
+        #    Multi-variant mode: select best-matching source embedding each frame.
+        with _T("select_variant", self._timings):
+            if self._selector is not None:
+                src_emb = self._selector.get_embedding(
+                    pristine, det.face_object, self._selector_convert_fn
+                )
+            else:
+                src_emb = self._src_emb
+
+        with _T("swap", self._timings):
+            swapped = self._run_dreamid_swap(aligned, src_emb)
+
+        # 9b. Shape correction — morph source face shape toward performer's shape.
+        #     Runs on the aligned crop BEFORE compositing so the warp never
+        #     touches the occluder pixels baked in by step 10.
+        if self._shape_adapter is not None:
+            with _T("shape_adapt", self._timings):
+                swapped = self._shape_adapter.adapt(aligned, swapped)
+
+        # ════════════════════════════════════════════════════════════════════
+        # 10. ALIGNED-SPACE COMPOSITE — the definitive ghost-killer.
+        #
+        # Blend in 256×256 aligned space where mask and images share the
+        # exact same pixel grid.  Where combined=0 (occluder), we use pixels
+        # from 'aligned' (the original face crop).  These are already the
+        # correct pristine values — the swap output NEVER touches them.
+        #
+        # No restoration step needed.  No alignment error possible.
+        # Warping an already-composited image merely repositions pixels;
+        # it does not change what colour they are.
+        # ════════════════════════════════════════════════════════════════════
+        with _T("align_composite", self._timings):
+            c3 = combined[:, :, np.newaxis]
+            composited_crop = (
+                c3 * swapped.astype(np.float32)
+                + (1.0 - c3) * aligned.astype(np.float32)
+            ).astype(np.uint8)
+
+        # 11. ESRGAN upscale (applied to the already-composited crop)
+        #     Upscaling the composited result means occluder pixels receive
+        #     the same ESRGAN pass as face pixels — consistent quality.
+        with _T("esrgan", self._timings):
+            composited_crop = self._upscale_face(composited_crop)
+        composited_crop = _sharpen(composited_crop, sigma=1.5, amount=0.25)
+
+        # 12. Warp composited crop + face ellipse back to full frame space.
+        #     Scale M if ESRGAN changed the crop size.
+        up_size = composited_crop.shape[0]
+        if up_size != self._swap_size:
+            scale = up_size / self._swap_size
+            M_up = M.copy()
+            M_up[:, :2] *= scale
+            M_up[:, 2] *= scale
+            M_inv = cv2.invertAffineTransform(M_up)
+            face_ellipse_up = cv2.resize(face_ellipse, (up_size, up_size),
+                                         interpolation=cv2.INTER_LINEAR)
+        else:
+            M_inv = cv2.invertAffineTransform(M)
+            face_ellipse_up = face_ellipse
+
+        h, w = frame.shape[:2]
+        warped_comp = cv2.warpAffine(
+            composited_crop, M_inv, (w, h),
+            flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE,
+        )
+        # Use the PLAIN face ellipse (not combined) for the outer boundary blend.
+        # The occluder handling is already baked into composited_crop — the ellipse
+        # only determines how the crop edges blend into the original background.
+        warped_ellipse = cv2.warpAffine(
+            face_ellipse_up, M_inv, (w, h),
+            flags=cv2.INTER_LINEAR, borderValue=0.0,
+        )
+        warped_ellipse = np.clip(warped_ellipse, 0.0, 1.0)
+        mask_u8 = (warped_ellipse * 255).astype(np.uint8)
+
+        # 13. Lab colour transfer (warped composite → match pristine lighting)
+        with _T("lab", self._timings):
+            if self._cfg.enable_lab_color:
+                warped_comp = self._color_transfer_lab(warped_comp, pristine, warped_ellipse)
+
+        # 14. Boundary colour spill fix
+        with _T("spill_fix", self._timings):
+            warped_comp = self._fix_boundary_color_spill(warped_comp, pristine, warped_ellipse)
+
+        # 15. Final composite into pristine (face ellipse = outer boundary only)
+        #     BoundarySeamFixer replaces alpha/Poisson with three-stage blending
+        #     when available; falls back to Poisson/alpha otherwise.
+        with _T("composite", self._timings):
+            if self._boundary_fixer is not None:
+                result = self._boundary_fixer.composite(pristine, warped_comp, warped_ellipse)
+            else:
+                result = self._poisson_composite(warped_comp, pristine, mask_u8)
+
+        # 16. Enhancement
+        with _T("enhance", self._timings):
+            result = self._run_codeformer(result, det)
+
+        # 17. Restore mouth (from pristine)
+        with _T("mouth_restore", self._timings):
+            result = self._restore_mouth(result, pristine, det.mesh_landmarks)
+
+        # 18. Temporal smooth with occlusion-aware buffer flush
+        with _T("temporal", self._timings):
+            result = self._temporal_smooth_occ(result, warped_ellipse)
+
+        self._failsafe.push_clean(result)
+        return result
+
+    def get_diagnostics(self) -> DiagnosticsDict:
+        fps = 0.0
+        if len(self._fps_times) >= 2:
+            e = self._fps_times[-1] - self._fps_times[0]
+            if e > 0:
+                fps = (len(self._fps_times) - 1) / e
+        d = DiagnosticsDict()
+        d["stage_latencies"] = dict(self._timings)
+        d["detection_confidence"] = self._last_conf
+        d["occlusion_map"] = None
+        d["failsafe_state"] = self._failsafe.state
+        d["frame_number"] = self._frame_num
+        d["fps"] = fps
+        return d
+
+    def shutdown(self) -> None:
+        if self._mesh is not None:
+            self._mesh.close()
+            self._mesh = None
+        if self._occ_detector is not None:
+            self._occ_detector.close()
+            self._occ_detector = None
+        self._prev_frame = None
+        self._lm_buf.clear()
+        print("[Pipeline] Shutdown")
+
+    # ------------------------------------------------------------------
+    # Private pipeline stages
+    # ------------------------------------------------------------------
+
+    def _detect_face(self, frame: np.ndarray) -> Optional[FaceDetection]:
+        faces = self._swapper.detect(frame)
+        if not faces:
+            self._last_conf = 0.0
+            return None
+        f = faces[0]
+        self._last_conf = float(getattr(f, "det_score", 1.0))
+
+        # MediaPipe 468 landmarks — run at max 640px wide to keep latency ~15ms
+        mesh = None
+        if self._mesh is not None:
+            h, w = frame.shape[:2]
+            _MAX_MESH_W = 640
+            if w > _MAX_MESH_W:
+                scale = _MAX_MESH_W / w
+                small = cv2.resize(frame, (_MAX_MESH_W, int(h * scale)))
+                sh, sw = small.shape[:2]
+            else:
+                small, sh, sw, scale = frame, h, w, 1.0
+            rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
+            res = self._mesh.process(rgb)
+            if res.multi_face_landmarks:
+                lm = res.multi_face_landmarks[0]
+                # Scale normalised coords back to original frame size
+                mesh = np.array([[p.x * w, p.y * h, p.z * w] for p in lm.landmark],
+                                dtype=np.float32)
+
+        return FaceDetection(
+            bbox=f.bbox, kps=f.kps, confidence=self._last_conf,
+            embedding=f.normed_embedding, mesh_landmarks=mesh, face_object=f,
+        )
+
+    def _smooth_landmarks(self, kps: np.ndarray) -> np.ndarray:
+        """EMA on 5-point keypoints (α=0.8, 5-frame window)."""
+        self._lm_buf.append(kps.astype(np.float32).copy())
+        if len(self._lm_buf) < 2:
+            return kps
+        a = self._cfg.landmark_ema_alpha
+        s = self._lm_buf[0].copy()
+        for pts in list(self._lm_buf)[1:]:
+            s = a * pts + (1.0 - a) * s
+        return s
+
+    def _generate_segmentation_mask(self, aligned: np.ndarray) -> np.ndarray:
+        """BiSeNet-FP face mask in aligned space [0,1]."""
+        if self._parser is not None:
+            return self._parser.parse_aligned(aligned)
+        # Ellipse fallback
+        h, w = aligned.shape[:2]
+        m = np.zeros((h, w), dtype=np.float32)
+        cv2.ellipse(m, (w // 2, h // 2), (int(w * 0.42), int(h * 0.48)),
+                    0, 0, 360, 1.0, -1)
+        return m
+
+    def _exclude_mouth_region(self, mask: np.ndarray,
+                              mesh: Optional[np.ndarray],
+                              M: np.ndarray) -> np.ndarray:
+        """Subtract MediaPipe lip contour from mask (aligned space)."""
+        if not self._cfg.enable_mouth_exclusion or mesh is None:
+            return mask
+        h, w = mask.shape[:2]
+
+        # Project outer lip landmarks: frame space → aligned space via M
+        lip_frame = mesh[OUTER_LIP_INDICES, :2]
+        ones = np.ones((lip_frame.shape[0], 1), dtype=np.float32)
+        lip_hom = np.hstack([lip_frame, ones])
+        lip_aligned = (lip_hom @ M.T).astype(np.int32)
+
+        # Mouth polygon
+        mouth = np.zeros((h, w), dtype=np.float32)
+        cv2.fillConvexPoly(mouth, lip_aligned, 1.0)
+
+        # Dilate + blur for feathered margin
+        fp = self._cfg.mouth_feather_px
+        if fp > 0:
+            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (fp * 2 + 1, fp * 2 + 1))
+            mouth = cv2.dilate(mouth, k)
+            mouth = cv2.GaussianBlur(mouth, (fp * 2 + 1, fp * 2 + 1), 0)
+
+        return np.clip(mask * (1.0 - mouth), 0.0, 1.0)
+
+    def _run_dreamid_swap(self, aligned: np.ndarray, src_emb: np.ndarray) -> np.ndarray:
+        """Face swap on aligned crop.
+
+        Currently Ghost backend.  When DreamID public weights ship,
+        replace this single call with DreamID inference at 512×512.
+        """
+        if self._is_ghost:
+            return self._backend._run(aligned, src_emb)
+        return aligned  # InsightFace path handled differently
+
+    def _upscale_face(self, face: np.ndarray) -> np.ndarray:
+        """Real-ESRGAN upscale (only when available — no blind resize)."""
+        if self._upsampler is not None:
+            try:
+                out, _ = self._upsampler.enhance(face, outscale=2)
+                return out
+            except Exception:
+                pass
+        return face
+
+    def _color_transfer_lab(self, src: np.ndarray, dst: np.ndarray,
+                            mask: np.ndarray) -> np.ndarray:
+        """Lab per-channel mean+std matching in masked face region."""
+        mb = mask > 0.3
+        if not mb.any():
+            return src
+        sl = cv2.cvtColor(src, cv2.COLOR_BGR2Lab).astype(np.float32)
+        dl = cv2.cvtColor(dst, cv2.COLOR_BGR2Lab).astype(np.float32)
+        out = sl.copy()
+        for c in range(3):
+            sv, dv = sl[:, :, c][mb], dl[:, :, c][mb]
+            sm, ss = sv.mean(), max(sv.std(), 1e-6)
+            dm, ds = dv.mean(), dv.std()
+            out[:, :, c] = 0.7 * ((out[:, :, c] - sm) * (ds / ss) + dm) + 0.3 * out[:, :, c]
+        return cv2.cvtColor(np.clip(out, 0, 255).astype(np.uint8), cv2.COLOR_Lab2BGR)
+
+    def _poisson_composite(self, pasted: np.ndarray, frame: np.ndarray,
+                           mask_u8: np.ndarray) -> np.ndarray:
+        """Poisson seamless clone with inward-only feathered mask."""
+        if not self._cfg.enable_poisson:
+            return self._gauss_blend(pasted, frame, mask_u8)
+        where = np.where(mask_u8 > 0)
+        if len(where[0]) == 0:
+            return frame
+        cy, cx = int(np.mean(where[0])), int(np.mean(where[1]))
+        # Inward-only feather for Poisson mask
+        hard = (mask_u8 > 0).astype(np.uint8) * 255
+        feathered = np.minimum(cv2.GaussianBlur(mask_u8, (21, 21), 0), hard)
+        try:
+            return cv2.seamlessClone(pasted, frame, feathered, (cx, cy), cv2.NORMAL_CLONE)
+        except cv2.error:
+            return self._gauss_blend(pasted, frame, mask_u8)
+
+    def _gauss_blend(self, pasted: np.ndarray, frame: np.ndarray,
+                     mask_u8: np.ndarray) -> np.ndarray:
+        """Soft Gaussian alpha blend — inward only."""
+        where = np.where(mask_u8 > 0)
+        if len(where[0]) == 0:
+            return frame
+        sz = max(where[0].max() - where[0].min(), where[1].max() - where[1].min())
+        bk = max(11, int(sz * 0.35)) | 1
+        mf = mask_u8.astype(np.float32) / 255.0
+        hard = (mf > 0.01).astype(np.float32)
+        alpha = np.minimum(cv2.GaussianBlur(mf, (bk, bk), 0), hard)[:, :, np.newaxis]
+        return (pasted.astype(np.float32) * alpha + frame.astype(np.float32) * (1.0 - alpha)).astype(np.uint8)
+
+    def _run_codeformer(self, frame: np.ndarray, det: FaceDetection) -> np.ndarray:
+        """CodeFormer / GFPGAN on the face region."""
+        if self._cf_net is None and self._gfpgan is None:
+            return frame
+        x1, y1, x2, y2 = (int(v) for v in det.bbox)
+        pad = 30
+        cx1, cy1 = max(0, x1 - pad), max(0, y1 - pad)
+        cx2, cy2 = min(frame.shape[1], x2 + pad), min(frame.shape[0], y2 + pad)
+        crop = frame[cy1:cy2, cx1:cx2]
+        if crop.size == 0:
+            return frame
+        result = frame.copy()
+        enhanced = self._cf_enhance(crop) if self._cf_net else self._gfpgan_enhance(crop)
+        if enhanced is not None:
+            result[cy1:cy2, cx1:cx2] = enhanced
+        return result
+
+    def _cf_enhance(self, crop: np.ndarray) -> Optional[np.ndarray]:
+        try:
+            import torch
+            h, w = crop.shape[:2]
+            f = cv2.resize(crop, (512, 512))
+            t = f[:, :, ::-1].copy().astype(np.float32) / 255.0
+            t = (t - 0.5) / 0.5
+            t = torch.from_numpy(t.transpose(2, 0, 1)).unsqueeze(0).to(self._cf_device)
+            with torch.no_grad():
+                o = self._cf_net(t, w=self._cfg.codeformer_fidelity, adain=True)[0]
+            o = o.squeeze(0).cpu().clamp(-1, 1).numpy()
+            o = ((o + 1) / 2 * 255).astype(np.uint8).transpose(1, 2, 0)[:, :, ::-1]
+            return cv2.resize(o, (w, h))
+        except Exception:
+            return None
+
+    def _gfpgan_enhance(self, crop: np.ndarray) -> Optional[np.ndarray]:
+        try:
+            _, _, enhanced = self._gfpgan.enhance(crop, has_aligned=False, only_center_face=True, paste_back=True)
+            return enhanced
+        except Exception:
+            return None
+
+    def _restore_mouth(self, composite: np.ndarray, original: np.ndarray,
+                       mesh: Optional[np.ndarray]) -> np.ndarray:
+        """Hard-paste original mouth pixels — final safety net."""
+        if not self._cfg.enable_mouth_exclusion or mesh is None:
+            return composite
+        h, w = composite.shape[:2]
+        lip = mesh[OUTER_LIP_INDICES, :2].astype(np.int32)
+        mouth = np.zeros((h, w), dtype=np.float32)
+        cv2.fillConvexPoly(mouth, lip, 1.0)
+        # Slight shrink then feather for clean seam
+        fp = max(1, self._cfg.mouth_feather_px // 2)
+        k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (fp * 2 + 1, fp * 2 + 1))
+        mouth_e = cv2.erode((mouth * 255).astype(np.uint8), k).astype(np.float32) / 255.0
+        kk = self._cfg.mouth_feather_px * 2 + 1
+        alpha = cv2.GaussianBlur(mouth_e, (kk, kk), 0)[:, :, np.newaxis]
+        return (original.astype(np.float32) * alpha + composite.astype(np.float32) * (1.0 - alpha)).astype(np.uint8)
+
+    def _make_face_ellipse(self, size: int) -> np.ndarray:
+        """Soft elliptical face mask at given crop size.
+
+        Used as the OUTER BOUNDARY for final frame compositing — it defines
+        where the swapped crop blends into the original background.
+        The occlusion cutout is NOT in this mask; it is baked into the
+        composited crop during the aligned-space composite step.
+
+        Aspect ratio: slightly taller than wide (55:48 for 128px, 110:96 for 256px)
+        following the natural oval face shape in canonical alignment.
+        """
+        mask = np.zeros((size, size), dtype=np.float32)
+        cx, cy = size // 2, size // 2
+        rx = int(size * 0.375)   # ~48/128 or 96/256
+        ry = int(size * 0.430)   # ~55/128 or 110/256
+        cv2.ellipse(mask, (cx, cy), (rx, ry), 0, 0, 360, 1.0, -1)
+        k = max(15, (size // 8) | 1)  # blur kernel scales with crop size
+        mask = cv2.GaussianBlur(mask, (k, k), k / 4.0)
+        return np.clip(mask, 0.0, 1.0)
+
+    # ------------------------------------------------------------------
+    # New ghost-fix methods (pre-swap occlusion architecture — v1 fallback)
+    # These are no longer called by process_frame when XSeg is available,
+    # but are kept for reference and for when XSeg model is absent.
+    # ------------------------------------------------------------------
+
+    def _preswap_occlusion(self, pristine: np.ndarray, det: FaceDetection,
+                           M: np.ndarray, size: int) -> Optional[np.ndarray]:
+        """Detect occluders on the pristine frame and warp to aligned space.
+
+        Called BEFORE the swap so the resulting mask can be multiplied with
+        the BiSeNet face mask to create a combined mask where occluded pixels
+        receive combined=0.0 — the compositor then uses 100% pristine pixels
+        in those locations, preventing any swap contamination.
+
+        Returns float32 [0,1] in aligned (size×size) space where 1.0=occluder,
+        or None if occlusion detection is disabled / unavailable.
+        """
+        if not self._cfg.enable_occlusion:
+            return None
+
+        interval = max(1, self._cfg.occlusion_check_interval)
+        run_full = (self._frame_num % interval == 0)
+
+        if run_full:
+            occluder_frame: Optional[np.ndarray] = None
+
+            if self._occ_detector is not None:
+                # Build a simple bbox-filled face mask for OcclusionDetector
+                face_mask_u8 = np.zeros(pristine.shape[:2], dtype=np.uint8)
+                x1, y1, x2, y2 = (int(v) for v in det.bbox)
+                cv2.rectangle(face_mask_u8, (x1, y1), (x2, y2), 255, -1)
+                occ = self._occ_detector.detect(pristine, face_mask_u8, det.face_object)
+                if occ is not None and occ.max() > 0.01:
+                    occluder_frame = occ
+
+            elif self._parser is not None:
+                occ = _detect_frame_occluders(pristine, det.bbox, self._parser)
+                if occ.max() > 0.01:
+                    occluder_frame = occ
+
+            self._last_occluder = occluder_frame
+
+        occluder_frame = self._last_occluder
+        if occluder_frame is None:
+            return None
+
+        # Warp from full frame space → aligned space using forward affine M.
+        # This maps the frame-space occluder mask into the same 256×256
+        # coordinate system as the BiSeNet face mask so we can multiply them.
+        occluder_aligned = cv2.warpAffine(
+            occluder_frame, M, (size, size),
+            flags=cv2.INTER_LINEAR, borderValue=0.0,
+        )
+        return np.clip(occluder_aligned, 0.0, 1.0)
+
+    def _fix_boundary_color_spill(self, pasted: np.ndarray, pristine: np.ndarray,
+                                   mask_frame: np.ndarray) -> np.ndarray:
+        """Suppress color spill at the feather boundary zone (mask 0.05–0.95).
+
+        In the narrow blend transition, swap skin tone can create a visible
+        halo around dark occluders (phones, cups, dark clothing).  We suppress
+        this by pulling swap colors 50% toward the original in that zone so
+        the color difference distributes smoothly rather than forming a ring.
+        """
+        boundary = ((mask_frame > 0.05) & (mask_frame < 0.95)).astype(np.float32)
+        if boundary.max() < 0.01:
+            return pasted
+        b3 = boundary[:, :, np.newaxis]
+        color_diff = pasted.astype(np.float32) - pristine.astype(np.float32)
+        adjusted = pasted.astype(np.float32) - color_diff * b3 * 0.5
+        return np.clip(adjusted, 0, 255).astype(np.uint8)
+
+    def _postswap_safety_net(self, pristine: np.ndarray, swapped: np.ndarray,
+                              pre_swap_mask: np.ndarray) -> np.ndarray:
+        """Post-swap error detection safety net (Layer 4).
+
+        Compares the swap result to the pristine original in pixels that our
+        pre-swap mask said were NOT face (i.e. should be untouched).  Large
+        differences there mean the swap bled into an occluder region — we
+        restore those pixels from pristine.
+
+        This is now a SAFETY NET only.  The pre-swap mask already prevents
+        the vast majority of ghost artifacts; this catches rare edge cases
+        (extreme motion blur, ESRGAN interpolation, etc.).
+        """
+        # Only inspect pixels outside the swap region
+        not_swap = (pre_swap_mask < 0.5).astype(np.float32)
+        if not_swap.max() < 0.01:
+            return swapped
+
+        # Per-pixel mean-channel absolute difference in the non-swap zone
+        diff = cv2.absdiff(swapped, pristine).astype(np.float32)
+        diff_gray = diff.mean(axis=2) * not_swap
+
+        # Threshold: >30 intensity difference outside swap region = ghost
+        ghost = (diff_gray > 30.0).astype(np.float32)
+        if ghost.max() < 0.01:
+            return swapped
+
+        # Dilate ghost mask to catch soft bleeding edges, then feather
+        ghost_k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        ghost = cv2.dilate(ghost, ghost_k)
+        ghost_soft = cv2.GaussianBlur(ghost, (9, 9), 0)[:, :, np.newaxis]
+        return (
+            pristine.astype(np.float32) * ghost_soft
+            + swapped.astype(np.float32) * (1.0 - ghost_soft)
+        ).astype(np.uint8)
+
+    def _temporal_smooth_occ(self, frame: np.ndarray,
+                              swap_mask: np.ndarray) -> np.ndarray:
+        """Temporal EMA blend with occlusion-aware buffer flushing.
+
+        Standard EMA:  output = α * current + (1-α) * buffer
+        Ghost problem: if the buffer contains a ghosted frame (from before
+        the fix was applied or during fast occlusion onset), the ghost bleeds
+        into the current frame through the blend.
+
+        Fix: when occlusion newly APPEARS (swap_mask area shrinks), flush the
+        EMA buffer in those pixels by replacing them with the current frame
+        (which already has clean pristine pixels from the compositor).  The
+        ghost-contaminated buffer values are overwritten before the EMA blend.
+        """
+        if not self._cfg.enable_temporal_smooth:
+            self._prev_frame = frame
+            self._prev_swap_mask = swap_mask
+            return frame
+        if self._prev_frame is None or self._prev_frame.shape != frame.shape:
+            self._prev_frame = frame.copy()
+            self._prev_swap_mask = swap_mask.copy()
+            return frame
+
+        prev_mask = self._prev_swap_mask if self._prev_swap_mask is not None else swap_mask
+
+        # Detect newly-occluded pixels: mask dropped from >0.5 to <0.2
+        newly_occluded = ((prev_mask > 0.5) & (swap_mask < 0.2)).astype(np.float32)
+        if newly_occluded.max() > 0.01:
+            # Flush buffer: replace occluded region with current (clean) frame
+            flush = cv2.GaussianBlur(newly_occluded, (11, 11), 0)[:, :, np.newaxis]
+            self._prev_frame = (
+                frame.astype(np.float32) * flush
+                + self._prev_frame.astype(np.float32) * (1.0 - flush)
+            ).astype(np.uint8)
+
+        a = self._cfg.temporal_smoothing_alpha
+        r = cv2.addWeighted(frame, a, self._prev_frame, 1.0 - a, 0)
+        self._prev_frame = r.copy()
+        self._prev_swap_mask = swap_mask.copy()
+        return r
+
+    def _temporal_smooth(self, frame: np.ndarray) -> np.ndarray:
+        if not self._cfg.enable_temporal_smooth:
+            self._prev_frame = frame
+            return frame
+        if self._prev_frame is None or self._prev_frame.shape != frame.shape:
+            self._prev_frame = frame
+            return frame
+        a = self._cfg.temporal_smoothing_alpha
+        r = cv2.addWeighted(frame, a, self._prev_frame, 1.0 - a, 0)
+        self._prev_frame = r.copy()
+        return r
+
+    def _check_occlusion(self, frame: np.ndarray, det: FaceDetection,
+                         mask_frame: np.ndarray):
+        """Detect occluders (hands, cups, mics) and subtract from swap mask.
+
+        Runs a full detection only every occlusion_check_interval frames;
+        reuses the cached result in between for performance.
+
+        Returns:
+            (modified_mask_frame, occluder_mask | None)
+        """
+        if not self._cfg.enable_occlusion:
+            return mask_frame, None
+
+        interval = max(1, self._cfg.occlusion_check_interval)
+        run_full = (self._frame_num % interval == 0)
+
+        if run_full:
+            face_mask_u8 = (mask_frame * 255).astype(np.uint8)
+            occluder = None
+
+            # Stage 1: OcclusionDetector (MediaPipe Hands — best for skin-coloured hands)
+            if self._occ_detector is not None:
+                occluder = self._occ_detector.detect(
+                    frame, face_mask_u8, det.face_object
+                )
+
+            # Stage 2: BiSeNet frame-space cross-check fallback
+            elif self._parser is not None:
+                occluder = _detect_frame_occluders(frame, det.bbox, self._parser)
+
+            self._last_occluder = occluder
+
+        occluder = self._last_occluder
+        if occluder is None or occluder.max() < 0.01:
+            return mask_frame, None
+
+        return mask_frame * (1.0 - occluder), occluder
+
+
+# ---------------------------------------------------------------------------
+# Config loader
+# ---------------------------------------------------------------------------
+
+def load_config_yaml(path: str = "config.yaml") -> PipelineConfig:
+    try:
+        import yaml
+    except ImportError:
+        return PipelineConfig()
+    if not os.path.exists(path):
+        return PipelineConfig()
+    with open(path, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    cfg = PipelineConfig()
+    for k, v in data.items():
+        if hasattr(cfg, k):
+            setattr(cfg, k, v)
+    return cfg

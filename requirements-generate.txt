@@ -1,0 +1,16 @@
+# Offline variant generation dependencies
+# Install separately ONLY if you use scripts/generate_source_faces.py
+# These are NOT required for the real-time pipeline.
+#
+# Usage:
+#   pip install -r requirements-generate.txt
+#
+# Then download IP-Adapter weights:
+#   https://huggingface.co/h94/IP-Adapter
+#   Place in: models/ip_adapter/
+
+diffusers>=0.25.0
+transformers>=4.36.0
+accelerate>=0.25.0
+Pillow>=10.0
+# IP-Adapter: pip install git+https://github.com/tencent-ailab/IP-Adapter.git

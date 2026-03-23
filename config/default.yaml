@@ -1,0 +1,172 @@
+# faceswap-stream — default configuration
+# All paths relative to project root.
+# Override individual keys via profile YAML files (config/profiles/).
+
+# ---------------------------------------------------------------------------
+# Source
+# ---------------------------------------------------------------------------
+source_image_path: "source_faces/"  # Directory = multi-variant mode; single file = static mode
+# source_image_path: "source_faces/front_neutral.png"  # single-file override
+
+# ---------------------------------------------------------------------------
+# Swap model
+# ---------------------------------------------------------------------------
+swap_model: "models/ghost_3_256.onnx"
+
+# ---------------------------------------------------------------------------
+# Capture
+# ---------------------------------------------------------------------------
+capture:
+  device_id: 0
+  width: 1920
+  height: 1080
+  fps: 30
+
+# ---------------------------------------------------------------------------
+# Detection
+# ---------------------------------------------------------------------------
+detection_confidence_threshold: 0.85
+
+# ---------------------------------------------------------------------------
+# Enhancement
+# ---------------------------------------------------------------------------
+codeformer_fidelity: 0.75        # 0.0 = max quality, 1.0 = max fidelity
+face_type: "realistic"           # "realistic" | "anime"
+
+# ---------------------------------------------------------------------------
+# Temporal stabilization
+# ---------------------------------------------------------------------------
+temporal_smoothing_alpha: 0.85   # Output frame EMA (0.85 current + 0.15 prev)
+landmark_ema_alpha: 0.8          # Landmark EMA (higher = more responsive)
+landmark_ema_window: 5           # Frames of landmark history
+
+# ---------------------------------------------------------------------------
+# Mouth exclusion
+# ---------------------------------------------------------------------------
+mouth_feather_px: 8              # Feather radius around lip contour
+
+# ---------------------------------------------------------------------------
+# Occlusion (Face Dragon technique)
+# ---------------------------------------------------------------------------
+occlusion_threshold: 15          # Self-reconstruction diff threshold (0–255)
+occlusion_check_interval: 3      # Frames between occlusion checks (cached in between)
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+output_width: 1920
+output_height: 1080
+obs_virtual_camera: true
+
+# ---------------------------------------------------------------------------
+# Failsafe
+# ---------------------------------------------------------------------------
+failsafe_freeze_seconds: 2.0     # Seconds before fade-to-black
+failsafe_buffer_size: 30         # Clean frame circular buffer size
+failsafe_fade_out_frames: 10     # Frames to fade to black
+failsafe_fade_in_frames: 5       # Frames to fade back in
+
+# ---------------------------------------------------------------------------
+# Feature toggles
+# ---------------------------------------------------------------------------
+# Heavy models — disabled by default for real-time speed (use --enhance to enable)
+enable_esrgan: false
+enable_codeformer: false
+# Poisson: highest quality composite but ~50-150ms on 1080p; disable for real-time
+enable_poisson: false
+enable_lab_color: true
+enable_mouth_exclusion: true
+enable_occlusion: true
+enable_temporal_smooth: true
+enable_bisenet_mask: true
+
+# ---------------------------------------------------------------------------
+# Eye region fix
+# ---------------------------------------------------------------------------
+# Three-part pipeline: CodeFormer restoration + orbital color match + blend.
+# Fixes lost eye detail, "panda mask" around eyes, and hard orbital boundary.
+# Runs AFTER shape correction, BEFORE XSeg masking.
+eye_fix:
+  enabled: true
+  restore_model: codeformer           # 'codeformer' or 'gfpgan'
+  restore_strength: 0.6               # 0.0-1.0, CodeFormer fidelity
+  apply_restoration_to: eyes_only     # 'eyes_only' or 'full_face'
+  upscale_before_restore: true
+  orbital_color_match: true
+  orbital_color_strength: 0.7
+  sclera_correction: true
+  orbital_blend: true
+
+# ---------------------------------------------------------------------------
+# Occlusion — XSeg (v2 definitive fix)
+# ---------------------------------------------------------------------------
+# XSeg is a purpose-trained model that runs on the ALIGNED 256×256 crop.
+# It replaces the entire 5-layer general-purpose system.
+# Accurate on skin-coloured occluders (hand flat on face) where all
+# general-purpose methods (BiSeNet, MediaPipe, depth) fail.
+#
+# Download: https://github.com/facefusion/facefusion-assets/releases/download/models-3.0.0/
+#   xseg_2.onnx → models/xseg_2.onnx   (recommended)
+#   xseg_1.onnx → models/xseg_1.onnx
+#
+# Auto-discovery order: xseg_2 → xseg_1 → xseg_3 → face_occluder
+xseg_model: ""                   # leave empty for auto-discovery from models/
+xseg_threshold: 0.5              # mask binarisation threshold
+xseg_blur_sigma: 5.0             # edge feathering sigma
+
+# ---------------------------------------------------------------------------
+# Mask tuning
+# ---------------------------------------------------------------------------
+mask_feather_kernel: 31          # Horizontal Gaussian kernel (anisotropic — vertical is half this)
+mask_feather_sigma: 5.0          # Gaussian blur sigma for mask boundary
+mask_erosion_px: 5               # Mask erosion in pixels (0 to disable)
+                                 # Anisotropic: sides erode e px, top/bottom e-1 px
+
+# ---------------------------------------------------------------------------
+# Shape correction
+# ---------------------------------------------------------------------------
+# Corrects the face shape mismatch between the AI source face and the
+# performer's actual face shape (jawline, forehead width).
+# Runs AFTER the swap model on the aligned 256×256 crop.
+# ---------------------------------------------------------------------------
+# Source face selection (multi-variant)
+# ---------------------------------------------------------------------------
+source_selection:
+  enabled: true
+  method: blend              # 'select' = pick best variant, 'blend' = blend top-3 embeddings
+  pose_weight: 3.0            # head pose is most important axis
+  temperature_weight: 2.0     # color temperature (warm/cool lighting)
+  direction_weight: 1.5       # lighting direction (side-lit vs front-lit)
+  luminance_weight: 1.0       # overall brightness match
+  switch_threshold: 0.15      # min relative improvement to consider switching (15%)
+  switch_delay_frames: 5      # consecutive frames before committing to a switch
+
+# ---------------------------------------------------------------------------
+shape_correction:
+  enabled: true
+  blend_strength: 0.7       # 0.0 = off, 1.0 = full match to performer shape
+  inner_radius: 0.3         # identity preservation zone (center of face)
+  outer_radius: 0.85        # full shape match zone (jawline area)
+  warp_method: delaunay     # 'delaunay' (fast, ~3ms) or 'tps' (quality, ~20ms)
+  temporal_smoothing: 0.7   # warp field EMA smoothing (0=no smooth, 1=frozen)
+  jawline_blend: 0.9        # extra weight for jawline points (most visible)
+  eye_blend: 0.15           # keep eyes close to source shape (identity)
+  nose_blend: 0.10          # keep nose close to source shape
+  mouth_blend: 0.10         # keep mouth close to source shape
+  landmark_model: ""        # path to ONNX 68-pt landmark model (auto-discovered)
+
+# ---------------------------------------------------------------------------
+# Boundary seam fixer
+# ---------------------------------------------------------------------------
+# Three-stage compositing that eliminates visible seams where the swapped
+# face meets the original frame (jawline, hairline, temples, ears).
+# Replaces the simple alpha / Poisson blend in the final composite step.
+boundary:
+  enabled: true
+  color_match_strength: 0.8     # 0=off, 1=full match to surrounding skin
+  blend_levels: 4               # Laplacian pyramid levels (more = better, slower)
+  boundary_width: 30            # Pixel width of boundary sampling zone
+  post_smooth_radius: 5         # Bilateral filter radius at seam
+  enable_color_transfer: true   # Stage 1 — Reinhard LAB color harmonization
+  enable_multiband: true        # Stage 2 — Laplacian pyramid multi-band blend
+  enable_post_refinement: true  # Stage 3 — seam-line bilateral micro-correction
