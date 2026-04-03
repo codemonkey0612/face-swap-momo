@@ -19,6 +19,51 @@ import glob
 import os
 import sys
 
+# ---------------------------------------------------------------------------
+# Inject CUDA / cuDNN DLL directories so onnxruntime CUDA provider works.
+# Python 3.8+ on Windows uses os.add_dll_directory(), not PATH.
+# ---------------------------------------------------------------------------
+def _inject_cuda_dll_dirs():
+    import glob as _glob
+
+    dirs_to_add = []
+
+    # nvidia-cudnn-cu12 pip package
+    try:
+        import nvidia.cudnn as _cudnn
+        # __file__ may be None for namespace packages — use __path__ instead
+        _base = (list(_cudnn.__path__) or [None])[0]
+        if _base:
+            _d = os.path.join(_base, "bin")
+            if os.path.isdir(_d):
+                dirs_to_add.append(_d)
+    except ImportError:
+        pass
+
+    # nvidia-cublas-cu12 pip package
+    try:
+        import nvidia.cublas as _cublas
+        _d = os.path.join(os.path.dirname(_cublas.__file__), "bin")
+        if os.path.isdir(_d):
+            dirs_to_add.append(_d)
+    except ImportError:
+        pass
+
+    # CUDA Toolkit installed on disk (v12.x)
+    for _cuda_root in _glob.glob("C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v12*"):
+        _d = os.path.join(_cuda_root, "bin")
+        if os.path.isdir(_d):
+            dirs_to_add.append(_d)
+
+    for _d in dirs_to_add:
+        os.environ["PATH"] = _d + os.pathsep + os.environ.get("PATH", "")
+        try:
+            os.add_dll_directory(_d)
+        except (OSError, AttributeError):
+            pass
+
+_inject_cuda_dll_dirs()
+
 
 # ---------------------------------------------------------------------------
 # Arg parsing
@@ -94,7 +139,7 @@ def _health_check(config) -> bool:
         gpu = any("CUDA" in p for p in providers)
         print(f"[Health] GPU: {'YES (CUDA)' if gpu else 'NO — CPU only'}")
         if not gpu:
-            print("[Health]  → Install onnxruntime-gpu and matching CUDA toolkit")
+            print("[Health]  -> Install onnxruntime-gpu and matching CUDA toolkit")
     except ImportError:
         print("[Health] CRITICAL: onnxruntime not installed")
         ok = False
@@ -103,7 +148,7 @@ def _health_check(config) -> bool:
     model = config.swap_model
     if os.path.exists(model):
         size_mb = os.path.getsize(model) / 1024 / 1024
-        print(f"[Health] Model: {model} ({size_mb:.0f} MB) ✓")
+        print(f"[Health] Model: {model} ({size_mb:.0f} MB) OK")
     else:
         print(f"[Health] MISSING model: {model}")
         ok = False
@@ -112,7 +157,7 @@ def _health_check(config) -> bool:
     for name in ("face_parser.onnx", "bisenet_resnet_34.onnx"):
         path = os.path.join("models", name)
         if os.path.exists(path):
-            print(f"[Health] Parser: {name} ✓")
+            print(f"[Health] Parser: {name} OK")
             break
     else:
         print("[Health] face_parser.onnx not found — run: python models/download_models.py")
@@ -268,7 +313,10 @@ def main():
         _run(args, cap)
     finally:
         cap.release()
-        cv2.destroyAllWindows()
+        try:
+            cv2.destroyAllWindows()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

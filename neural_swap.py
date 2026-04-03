@@ -61,12 +61,46 @@ _ARCFACE_112 = np.array([
 
 
 def _best_providers():
-    """Return best available ONNX execution providers."""
+    """Return best available ONNX execution providers, validated by a live DLL check.
+
+    NOTE: cuDNN 9.x requires Turing+ GPU (SM 7.5+). Pascal GPUs (GTX 1050 = SM 6.1)
+    are incompatible — force CPU on those. RTX 20xx+ will use GPU automatically.
+    """
     try:
         import onnxruntime as ort
         available = ort.get_available_providers()
+
+        # Check GPU compute capability — skip CUDA on Pascal (SM < 7.0)
+        if "CUDAExecutionProvider" in available:
+            try:
+                import subprocess, re
+                result = subprocess.run(
+                    ["nvidia-smi", "--query-gpu=compute_cap", "--format=csv,noheader"],
+                    capture_output=True, text=True, timeout=5
+                )
+                caps = result.stdout.strip().split("\n")
+                max_cap = max(float(c.strip()) for c in caps if c.strip())
+                if max_cap < 7.0:
+                    print(f"[NeuralSwap] GPU compute capability {max_cap} < 7.0 "
+                          f"(cuDNN 9.x requires Turing+) — using CPU")
+                    return ["CPUExecutionProvider"]
+            except Exception:
+                pass
         for p in ["CUDAExecutionProvider", "CoreMLExecutionProvider"]:
             if p in available:
+                # Validate the provider DLL actually loads before committing to it.
+                # On Windows, CUDA/cuDNN DLLs may be missing even when the provider
+                # appears in get_available_providers().
+                try:
+                    import ctypes, os
+                    ort_capi = os.path.join(os.path.dirname(ort.__file__), "capi")
+                    if "CUDA" in p:
+                        dll = os.path.join(ort_capi, "onnxruntime_providers_cuda.dll")
+                        if os.path.exists(dll):
+                            ctypes.CDLL(dll)  # raises OSError if deps missing
+                except OSError:
+                    print(f"[NeuralSwap] {p} DLL failed to load — falling back to CPU.")
+                    continue
                 return [p, "CPUExecutionProvider"]
     except Exception:
         pass
@@ -822,7 +856,7 @@ class _InsightFaceBackend:
         self._swapper = insightface.model_zoo.get_model(
             model_path, download=False, download_zip=False,
         )
-        self._swapper.prepare(ctx_id=0)
+        self._swapper.prepare(ctx_id=_ctx_id(providers))
 
     def detect(self, img):
         faces = self._app.get(img)

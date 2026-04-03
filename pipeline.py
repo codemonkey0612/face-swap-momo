@@ -1014,8 +1014,8 @@ class UltimateSwapPipeline:
             try:
                 out, _ = self._upsampler.enhance(face, outscale=2)
                 return out
-            except Exception:
-                pass
+            except Exception as e:
+                logging.getLogger(__name__).warning("ESRGAN upscale failed: %s", e)
         return face
 
     def _color_transfer_lab(self, src: np.ndarray, dst: np.ndarray,
@@ -1094,14 +1094,16 @@ class UltimateSwapPipeline:
             o = o.squeeze(0).cpu().clamp(-1, 1).numpy()
             o = ((o + 1) / 2 * 255).astype(np.uint8).transpose(1, 2, 0)[:, :, ::-1]
             return cv2.resize(o, (w, h))
-        except Exception:
+        except Exception as e:
+            logging.getLogger(__name__).debug("CodeFormer enhance failed: %s", e)
             return None
 
     def _gfpgan_enhance(self, crop: np.ndarray) -> Optional[np.ndarray]:
         try:
             _, _, enhanced = self._gfpgan.enhance(crop, has_aligned=False, only_center_face=True, paste_back=True)
             return enhanced
-        except Exception:
+        except Exception as e:
+            logging.getLogger(__name__).debug("GFPGAN enhance failed: %s", e)
             return None
 
     def _restore_mouth(self, composite: np.ndarray, original: np.ndarray,

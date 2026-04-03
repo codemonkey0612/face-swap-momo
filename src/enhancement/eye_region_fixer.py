@@ -15,11 +15,14 @@ Three-part pipeline:
   Part 3: Gradient eye-orbit blending + sclera color correction
 """
 
+import logging
 import os
 from typing import Dict, Optional
 
 import cv2
 import numpy as np
+
+log = logging.getLogger(__name__)
 
 
 class EyeRegionFixer:
@@ -200,7 +203,8 @@ class EyeRegionFixer:
             out = np.clip(out, 0, 255).astype(np.uint8)
             # RGB → BGR
             return out[:, :, ::-1].copy()
-        except Exception:
+        except Exception as e:
+            log.debug("CodeFormer ONNX infer failed: %s", e)
             return None
 
     def _cf_torch_infer(self, crop_512: np.ndarray, fidelity: float) -> Optional[np.ndarray]:
@@ -214,7 +218,8 @@ class EyeRegionFixer:
             o = o.squeeze(0).cpu().clamp(-1, 1).numpy()
             o = ((o + 1) / 2 * 255).astype(np.uint8).transpose(1, 2, 0)
             return o[:, :, ::-1].copy()
-        except Exception:
+        except Exception as e:
+            log.debug("CodeFormer torch infer failed: %s", e)
             return None
 
     def _gfpgan_infer(self, crop_512: np.ndarray) -> Optional[np.ndarray]:
@@ -225,7 +230,8 @@ class EyeRegionFixer:
             if enhanced is not None and enhanced.ndim == 3:
                 return enhanced
             return None
-        except Exception:
+        except Exception as e:
+            log.debug("GFPGAN infer failed: %s", e)
             return None
 
     # ------------------------------------------------------------------
