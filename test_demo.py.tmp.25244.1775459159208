@@ -1,0 +1,290 @@
+"""Demo v5 — clean pipeline, no over-processing."""
+
+import os
+import sys
+import cv2
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from neural_swap import NeuralFaceSwapper, FaceParser, _align_face, _best_providers, _sharpen
+from src.shape.face_shape_adapter import FaceShapeAdapter
+
+
+def main():
+    source_dir = "source_faces"
+    input_image = "original_face.png"
+    if not os.path.exists(input_image) or os.path.getsize(input_image) < 1000:
+        input_image = ".venv/lib/python3.12/site-packages/matplotlib/mpl-data/sample_data/grace_hopper.jpg"
+        print(f"[Demo] Using test image: {input_image}")
+
+    frame = cv2.imread(input_image)
+    if frame is None:
+        print(f"ERROR: Cannot read {input_image}")
+        return
+    pristine = frame.copy()
+    h, w = frame.shape[:2]
+
+    # --- Load ---
+    providers = _best_providers()
+    swapper = NeuralFaceSwapper(model_path="models/ghost_3_256.onnx", occlusion=False)
+    backend = swapper._backend
+    sz = backend._size
+
+    parser = None
+    p = os.path.join("models", "face_parser.onnx")
+    if os.path.exists(p):
+        parser = FaceParser(p, providers)
+
+    cf_sess = None
+    p = os.path.join("models", "codeformer.onnx")
+    if os.path.exists(p):
+        import onnxruntime as ort
+        cf_sess = ort.InferenceSession(p, providers=providers)
+
+    shape_adapter = None
+    try:
+        shape_adapter = FaceShapeAdapter({
+            "blend_strength": 0.85, "inner_radius": 0.20, "outer_radius": 0.75,
+            "warp_method": "delaunay", "jawline_blend": 0.95,
+            "eye_blend": 0.12, "nose_blend": 0.08, "mouth_blend": 0.08,
+        })
+    except Exception:
+        pass
+
+    # --- Detect ---
+    target_face = swapper.detect(frame)
+    if not target_face:
+        print("ERROR: No face"); return
+    target_face = target_face[0]
+
+    source_img = cv2.imread(os.path.join(source_dir, "front_neutral.png"))
+    source_face = swapper.detect(source_img)
+    if not source_face:
+        print("ERROR: No source face"); return
+    source_face = source_face[0]
+    src_emb = backend._convert_embedding(source_face.normed_embedding)
+    src_aligned, _ = _align_face(source_img, source_face.kps, sz)
+
+    # --- ALIGNED SPACE ---
+    aligned, M = _align_face(frame, target_face.kps, sz)
+
+    # 1. Ghost swap
+    print("[1] Ghost swap")
+    swapped = backend._run(aligned, src_emb)
+
+    # 2. Shape match to original face contours
+    if shape_adapter:
+        print("[2] Shape adaptation")
+        swapped = shape_adapter.adapt(aligned, swapped)
+
+    # 3. Lab color transfer from AI source — stronger to actually match
+    print("[3] Skin tone + brightness matching")
+    swapped = _reinhard_transfer(swapped, src_aligned, strength=0.75)
+
+    # 4. Skin smoothing — lighter to preserve contrast
+    print("[4] Skin smoothing")
+    swapped = _bilateral_smooth(swapped, strength=0.3)
+
+    # 5. Pupil sharpening (CLAHE + unsharp on iris only)
+    print("[5] Pupil sharpening")
+    swapped = _sharpen_pupils(swapped)
+
+    # 6. CodeFormer LAST — restores detail on everything including eyes
+    #    Higher fidelity (0.4) to preserve the color work we just did
+    if cf_sess:
+        print("[6] CodeFormer restoration")
+        swapped = _codeformer(cf_sess, swapped, fidelity=0.4)
+
+    # 7. Final gentle sharpen
+    swapped = _sharpen(swapped, sigma=0.8, amount=0.2)
+
+    # Debug: save aligned comparison
+    cv2.imwrite("debug_aligned_compare.png", np.hstack([aligned, swapped, src_aligned]))
+
+    # --- COMPOSITE ---
+    # Face ellipse mask (large enough to cover full face)
+    ell = np.zeros((sz, sz), dtype=np.float32)
+    cv2.ellipse(ell, (sz // 2, sz // 2),
+                (int(sz * 0.48), int(sz * 0.55)), 0, 0, 360, 1.0, -1)
+
+    # BiSeNet inner face + dilate for coverage
+    if parser:
+        inner = parser.parse_aligned(aligned)
+        dk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (21, 21))
+        inner = cv2.dilate((inner * 255).astype(np.uint8), dk).astype(np.float32) / 255.0
+        mask = ell * inner
+    else:
+        mask = ell
+
+    # Feather inward
+    mask = cv2.GaussianBlur(mask, (41, 41), 7.0)
+    mask = np.minimum(mask, (mask > 0.005).astype(np.float32))
+
+    # Composite in aligned space
+    c3 = mask[:, :, np.newaxis]
+    comp = (c3 * swapped.astype(np.float32)
+            + (1.0 - c3) * aligned.astype(np.float32)).astype(np.uint8)
+
+    # Warp back to frame
+    M_inv = cv2.invertAffineTransform(M)
+    warped = cv2.warpAffine(comp, M_inv, (w, h),
+                             flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+    wmask = cv2.warpAffine(ell, M_inv, (w, h),
+                            flags=cv2.INTER_LINEAR, borderValue=0.0)
+    wmask = np.clip(wmask, 0, 1)
+    wmask = cv2.GaussianBlur(wmask, (31, 31), 6.0)
+    wmask = np.minimum(wmask, (wmask > 0.005).astype(np.float32))
+
+    m3 = wmask[:, :, np.newaxis]
+    result = (m3 * warped.astype(np.float32)
+              + (1.0 - m3) * pristine.astype(np.float32))
+    result = np.clip(result, 0, 255).astype(np.uint8)
+
+    # --- Save ---
+    cv2.imwrite("demo_swapped.png", result)
+
+    th = min(h, 720)
+    sc = th / h
+    i1 = cv2.resize(pristine, (int(w * sc), th))
+    i2 = cv2.resize(result, (int(w * sc), th))
+    cv2.putText(i1, "BEFORE", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 255), 2)
+    cv2.putText(i2, "AFTER", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2)
+    cv2.imwrite("demo_result.png",
+                np.hstack([i1, np.full((th, 4, 3), 255, np.uint8), i2]))
+    print("Done — demo_result.png, debug_aligned_compare.png")
+
+
+# ---------------------------------------------------------------------------
+
+def _match_brightness(src, ref, strength=0.7):
+    """Match the L (lightness) channel mean to the AI source face."""
+    lab_s = cv2.cvtColor(src, cv2.COLOR_BGR2Lab).astype(np.float64)
+    lab_r = cv2.cvtColor(ref, cv2.COLOR_BGR2Lab).astype(np.float64)
+    if lab_r.shape[:2] != lab_s.shape[:2]:
+        lab_r = cv2.resize(lab_r, (lab_s.shape[1], lab_s.shape[0])).astype(np.float64)
+
+    # Shift L channel mean toward reference
+    s_mean = lab_s[:, :, 0].mean()
+    r_mean = lab_r[:, :, 0].mean()
+    shift = (r_mean - s_mean) * strength
+    lab_s[:, :, 0] = np.clip(lab_s[:, :, 0] + shift, 0, 255)
+
+    return cv2.cvtColor(lab_s.astype(np.uint8), cv2.COLOR_Lab2BGR)
+
+
+def _reinhard_transfer(src, ref, strength=0.5):
+    """Global Reinhard Lab color transfer — clean, no artifacts."""
+    lab_s = cv2.cvtColor(src, cv2.COLOR_BGR2Lab).astype(np.float64)
+    lab_r = cv2.cvtColor(ref, cv2.COLOR_BGR2Lab).astype(np.float64)
+    if lab_r.shape[:2] != lab_s.shape[:2]:
+        lab_r = cv2.resize(lab_r, (lab_s.shape[1], lab_s.shape[0])).astype(np.float64)
+
+    out = lab_s.copy()
+    for c in range(3):
+        sm, ss = lab_s[:, :, c].mean(), max(lab_s[:, :, c].std(), 1e-6)
+        rm, rs = lab_r[:, :, c].mean(), max(lab_r[:, :, c].std(), 1e-6)
+        t = (lab_s[:, :, c] - sm) * (rs / ss) + rm
+        out[:, :, c] = strength * t + (1.0 - strength) * lab_s[:, :, c]
+    return cv2.cvtColor(np.clip(out, 0, 255).astype(np.uint8), cv2.COLOR_Lab2BGR)
+
+
+def _bilateral_smooth(face, strength=0.45):
+    """Uniform bilateral smoothing — full face, no exclusions."""
+    lab = cv2.cvtColor(face, cv2.COLOR_BGR2Lab)
+    L = lab[:, :, 0].astype(np.float32)
+    L_s = cv2.bilateralFilter(L.astype(np.uint8), d=12, sigmaColor=75, sigmaSpace=75).astype(np.float32)
+    try:
+        L_g = cv2.ximgproc.guidedFilter(
+            guide=L.astype(np.uint8), src=L_s.astype(np.uint8),
+            radius=10, eps=80).astype(np.float32)
+        L_s = 0.5 * L_s + 0.5 * L_g
+    except AttributeError:
+        pass
+    lab[:, :, 0] = np.clip(strength * L_s + (1.0 - strength) * L, 0, 255).astype(np.uint8)
+    return cv2.cvtColor(lab, cv2.COLOR_Lab2BGR)
+
+
+def _sharpen_pupils(face):
+    """CLAHE + unsharp on iris region only. No sclera/catchlight changes."""
+    h, w = face.shape[:2]
+    result = face.copy()
+    for cx_f, cy_f in [(0.35, 0.38), (0.65, 0.38)]:
+        cx, cy = int(w * cx_f), int(h * cy_f)
+        r = int(w * 0.09)
+        x1, y1 = max(0, cx - r), max(0, cy - r)
+        x2, y2 = min(w, cx + r), min(h, cy + r)
+        if x2 <= x1 or y2 <= y1:
+            continue
+
+        roi = result[y1:y2, x1:x2].copy()
+        rh, rw = roi.shape[:2]
+
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        _, th = cv2.threshold(gray, 75, 255, cv2.THRESH_BINARY_INV)
+        contours, _ = cv2.findContours(th, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            continue
+        best = max(contours, key=cv2.contourArea)
+        if cv2.contourArea(best) < 15:
+            continue
+
+        (ix, iy), ir = cv2.minEnclosingCircle(best)
+        ix, iy, ir = int(ix), int(iy), max(int(ir), 3)
+
+        # Iris mask with soft edge
+        imask = np.zeros((rh, rw), dtype=np.float32)
+        cv2.circle(imask, (ix, iy), ir + 2, 1.0, -1)
+        imask = cv2.GaussianBlur(imask, (5, 5), 1.5)
+
+        # CLAHE on L
+        lab = cv2.cvtColor(roi, cv2.COLOR_BGR2Lab)
+        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(4, 4))
+        L_e = clahe.apply(lab[:, :, 0])
+        lab[:, :, 0] = np.clip(
+            imask * L_e.astype(np.float32) + (1.0 - imask) * lab[:, :, 0].astype(np.float32),
+            0, 255).astype(np.uint8)
+        roi = cv2.cvtColor(lab, cv2.COLOR_Lab2BGR)
+
+        # Unsharp on iris
+        blur = cv2.GaussianBlur(roi, (0, 0), sigmaX=0.7)
+        sharp = cv2.addWeighted(roi, 1.35, blur, -0.35, 0)
+        im3 = imask[:, :, np.newaxis]
+        roi = np.clip(im3 * sharp.astype(np.float32)
+                      + (1.0 - im3) * roi.astype(np.float32), 0, 255).astype(np.uint8)
+
+        result[y1:y2, x1:x2] = roi
+    return result
+
+
+def _codeformer(sess, face, fidelity=0.4):
+    """CodeFormer restoration — sharpens everything including eyes."""
+    h, w = face.shape[:2]
+    inp = cv2.resize(face, (512, 512))
+    inp = inp[:, :, ::-1].astype(np.float32) / 255.0
+    inp = (inp - 0.5) / 0.5
+    inp = np.expand_dims(inp.transpose(2, 0, 1), 0)
+
+    feeds = {}
+    for n in sess.get_inputs():
+        if n.shape and len(n.shape) == 4:
+            feeds[n.name] = inp
+        else:
+            dt = np.float64 if "double" in n.type else np.float32
+            feeds[n.name] = np.array([[fidelity]], dtype=dt)
+    try:
+        out = sess.run(None, feeds)[0]
+    except Exception as e:
+        print(f"  CodeFormer failed: {e}")
+        return face
+
+    out = np.clip(out[0], -1, 1)
+    out = ((out + 1) / 2 * 255).round().astype(np.uint8)
+    out = out.transpose(1, 2, 0)[:, :, ::-1]
+    out = cv2.resize(out, (w, h))
+    # Blend: mostly CodeFormer, slight original preservation
+    return cv2.addWeighted(out, 0.8, face, 0.2, 0)
+
+
+if __name__ == "__main__":
+    main()

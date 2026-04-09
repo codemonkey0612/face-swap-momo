@@ -1,0 +1,81 @@
+"""Quick demo: process a single image through the pipeline and save before/after."""
+
+import os
+import sys
+import cv2
+import numpy as np
+
+# Ensure project root is on path
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from pipeline import UltimateSwapPipeline, PipelineConfig
+
+
+def main():
+    source_dir = "source_faces"
+    input_image = "original_face.png"
+    output_path = "demo_result.png"
+
+    # Load input
+    frame = cv2.imread(input_image)
+    if frame is None:
+        print(f"ERROR: Cannot read {input_image}")
+        return
+
+    print(f"[Demo] Input image: {frame.shape[1]}x{frame.shape[0]}")
+
+    # Configure pipeline — disable heavy optional features for speed
+    cfg = PipelineConfig(
+        source_image_path=source_dir,
+        swap_model="models/ghost_3_256.onnx",
+        enable_esrgan=False,
+        enable_codeformer=False,
+        enable_poisson=False,
+        enable_lab_color=True,
+        enable_mouth_exclusion=True,
+        enable_occlusion=True,
+        enable_bisenet_mask=True,
+        enable_temporal_smooth=False,   # no temporal for single image
+        enable_eye_fix=True,
+        enable_shape_correction=True,
+        enable_boundary_fix=True,
+        obs_virtual_camera=False,
+    )
+
+    print("[Demo] Initializing pipeline...")
+    pipeline = UltimateSwapPipeline(source_dir, cfg)
+    print("[Demo] Pipeline ready. Processing frame...")
+
+    # Process
+    result = pipeline.process_frame(frame)
+
+    # Create side-by-side comparison
+    h1, w1 = frame.shape[:2]
+    h2, w2 = result.shape[:2]
+
+    # Resize to same height if needed
+    target_h = min(h1, h2, 720)
+    scale1 = target_h / h1
+    scale2 = target_h / h2
+    img1 = cv2.resize(frame, (int(w1 * scale1), target_h))
+    img2 = cv2.resize(result, (int(w2 * scale2), target_h))
+
+    # Add labels
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    cv2.putText(img1, "BEFORE", (20, 40), font, 1.0, (0, 0, 255), 2)
+    cv2.putText(img2, "AFTER", (20, 40), font, 1.0, (0, 255, 0), 2)
+
+    # Separator line
+    sep = np.full((target_h, 4, 3), 255, dtype=np.uint8)
+
+    comparison = np.hstack([img1, sep, img2])
+    cv2.imwrite(output_path, comparison)
+    print(f"[Demo] Saved comparison to {output_path}")
+
+    # Also save result only
+    cv2.imwrite("demo_swapped.png", result)
+    print(f"[Demo] Saved swapped frame to demo_swapped.png")
+
+
+if __name__ == "__main__":
+    main()
