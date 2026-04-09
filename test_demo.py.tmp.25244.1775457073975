@@ -1,0 +1,315 @@
+"""Quick demo: process a single image through the pipeline and save before/after.
+
+Fixes v3:
+  1. Vivid skin — boost saturation + brightness to match AI face vibrancy
+  2. Vivid eyes — CLAHE + sclera brightening + sharpening on eye region
+  3. Match original face shape — FaceShapeAdapter warps swapped face to
+     conform to the performer's jawline, forehead, and face contour
+"""
+
+import os
+import sys
+import cv2
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from neural_swap import NeuralFaceSwapper, FaceParser, _align_face, _best_providers, _sharpen
+from src.beauty.eye_enhancement import EyeEnhancer
+from src.shape.face_shape_adapter import FaceShapeAdapter
+
+
+def main():
+    source_dir = "source_faces"
+    input_image = "original_face.png"
+    if not os.path.exists(input_image) or os.path.getsize(input_image) < 1000:
+        input_image = ".venv/lib/python3.12/site-packages/matplotlib/mpl-data/sample_data/grace_hopper.jpg"
+        print(f"[Demo] original_face.png not usable, using test image: {input_image}")
+
+    frame = cv2.imread(input_image)
+    if frame is None:
+        print(f"ERROR: Cannot read {input_image}")
+        return
+    print(f"[Demo] Input image: {frame.shape[1]}x{frame.shape[0]}")
+    pristine = frame.copy()
+
+    # --- Load models ---
+    print("[Demo] Loading models...")
+    providers = _best_providers()
+    swapper = NeuralFaceSwapper(model_path="models/ghost_3_256.onnx", occlusion=False)
+    backend = swapper._backend
+
+    parser = None
+    for name in ("face_parser.onnx", "bisenet_resnet_34.onnx"):
+        p = os.path.join("models", name)
+        if os.path.exists(p):
+            parser = FaceParser(p, providers)
+            break
+
+    codeformer_sess = None
+    cf_path = os.path.join("models", "codeformer.onnx")
+    if os.path.exists(cf_path):
+        try:
+            import onnxruntime as ort
+            codeformer_sess = ort.InferenceSession(cf_path, providers=providers)
+            print("[Demo] CodeFormer ONNX loaded")
+        except Exception as e:
+            print(f"[Demo] CodeFormer load failed: {e}")
+
+    # FIX #3: Shape adapter to match original face contours
+    shape_adapter = None
+    try:
+        shape_adapter = FaceShapeAdapter({
+            "blend_strength": 0.8,
+            "inner_radius": 0.25,
+            "outer_radius": 0.80,
+            "warp_method": "delaunay",
+            "jawline_blend": 0.95,
+            "eye_blend": 0.15,
+            "nose_blend": 0.10,
+            "mouth_blend": 0.10,
+        })
+        print("[Demo] FaceShapeAdapter loaded")
+    except Exception as e:
+        print(f"[Demo] FaceShapeAdapter failed: {e}")
+
+    # --- Detect faces ---
+    print("[Demo] Detecting faces...")
+    target_faces = swapper.detect(frame)
+    if not target_faces:
+        print("ERROR: No face in input image")
+        return
+    target_face = target_faces[0]
+
+    source_path = os.path.join(source_dir, "front_neutral.png")
+    source_img = cv2.imread(source_path)
+    source_faces = swapper.detect(source_img)
+    if not source_faces:
+        print("ERROR: No face in source image")
+        return
+    source_face = source_faces[0]
+    src_emb = backend._convert_embedding(source_face.normed_embedding)
+
+    # Aligned source face for color reference
+    source_aligned, _ = _align_face(source_img, source_face.kps, backend._size)
+
+    # --- Step 1: Align & Swap ---
+    swap_size = backend._size
+    aligned, M = _align_face(frame, target_face.kps, swap_size)
+
+    print("[Demo] Running Ghost face swap...")
+    swapped_aligned = backend._run(aligned, src_emb)
+
+    # --- Step 2: Shape adaptation — morph to match original face contours ---
+    if shape_adapter is not None:
+        print("[Demo] Adapting face shape to match original...")
+        swapped_aligned = shape_adapter.adapt(aligned, swapped_aligned)
+
+    # --- Step 3: Color transfer from AI source face (vivid skin) ---
+    print("[Demo] Transferring AI face skin tone...")
+    swapped_aligned = _transfer_vivid_color(swapped_aligned, source_aligned, strength=0.7)
+
+    # --- Step 4: CodeFormer for clarity ---
+    if codeformer_sess is not None:
+        print("[Demo] Applying CodeFormer face restoration...")
+        swapped_aligned = _apply_codeformer(codeformer_sess, swapped_aligned, fidelity=0.3)
+
+    # --- Step 5: Boost saturation for vivid skin ---
+    swapped_aligned = _boost_vivid(swapped_aligned, saturation=1.35, brightness=1.08)
+
+    # --- Step 6: Skin smoothing (full face) ---
+    print("[Demo] Applying skin smoothing...")
+    swapped_aligned = _smooth_face(swapped_aligned, strength=0.55)
+
+    # --- Step 7: Mild sharpen ---
+    swapped_aligned = _sharpen(swapped_aligned, sigma=1.0, amount=0.3)
+
+    # --- Step 8: Build mask and composite ---
+    # Large ellipse mask
+    ell = np.zeros((swap_size, swap_size), dtype=np.float32)
+    cx, cy = swap_size // 2, swap_size // 2
+    cv2.ellipse(ell, (cx, cy), (int(swap_size * 0.48), int(swap_size * 0.55)),
+                0, 0, 360, 1.0, -1)
+
+    # BiSeNet refinement + dilation for full coverage
+    if parser is not None:
+        inner_mask = parser.parse_aligned(aligned)
+        dk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (19, 19))
+        inner_dilated = cv2.dilate(
+            (inner_mask * 255).astype(np.uint8), dk
+        ).astype(np.float32) / 255.0
+        combined_mask = ell * inner_dilated
+    else:
+        combined_mask = ell
+
+    # Generous feathering
+    feathered = cv2.GaussianBlur(combined_mask, (41, 41), 7.0)
+    hard = (combined_mask > 0.01).astype(np.float32)
+    feathered = np.minimum(feathered, hard)
+
+    # Aligned-space composite
+    c3 = feathered[:, :, np.newaxis]
+    composited = (c3 * swapped_aligned.astype(np.float32)
+                  + (1.0 - c3) * aligned.astype(np.float32)).astype(np.uint8)
+
+    # --- Step 9: Warp back to frame space ---
+    M_inv = cv2.invertAffineTransform(M)
+    h, w = frame.shape[:2]
+    warped_comp = cv2.warpAffine(composited, M_inv, (w, h),
+                                  flags=cv2.INTER_LINEAR,
+                                  borderMode=cv2.BORDER_REPLICATE)
+    warped_mask = cv2.warpAffine(ell, M_inv, (w, h),
+                                  flags=cv2.INTER_LINEAR, borderValue=0.0)
+    warped_mask = np.clip(warped_mask, 0.0, 1.0)
+
+    warped_mask_soft = cv2.GaussianBlur(warped_mask, (31, 31), 6.0)
+    warped_mask_hard = (warped_mask > 0.01).astype(np.float32)
+    warped_mask_soft = np.minimum(warped_mask_soft, warped_mask_hard)
+
+    m3 = warped_mask_soft[:, :, np.newaxis]
+    result = (m3 * warped_comp.astype(np.float32)
+              + (1.0 - m3) * pristine.astype(np.float32)).astype(np.uint8)
+
+    # --- Step 10: Eye enhancement in frame space (vivid eyes) ---
+    print("[Demo] Enhancing eyes...")
+    eye_enhancer = EyeEnhancer({"strength": 0.6})
+    result = eye_enhancer.enhance(result, target_face.kps)
+
+    # --- Step 11: Final light sharpen on face ---
+    blurred = cv2.GaussianBlur(result, (0, 0), sigmaX=1.2)
+    sharpened = cv2.addWeighted(result, 1.3, blurred, -0.3, 0)
+    result = (m3 * sharpened.astype(np.float32)
+              + (1.0 - m3) * result.astype(np.float32))
+    result = np.clip(result, 0, 255).astype(np.uint8)
+
+    # --- Save outputs ---
+    cv2.imwrite("demo_swapped.png", result)
+    print("[Demo] Saved demo_swapped.png")
+
+    target_h = min(h, 720)
+    scale = target_h / h
+    img1 = cv2.resize(pristine, (int(w * scale), target_h))
+    img2 = cv2.resize(result, (int(w * scale), target_h))
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    cv2.putText(img1, "BEFORE", (20, 40), font, 1.0, (0, 0, 255), 2)
+    cv2.putText(img2, "AFTER", (20, 40), font, 1.0, (0, 255, 0), 2)
+    sep = np.full((target_h, 4, 3), 255, dtype=np.uint8)
+    comparison = np.hstack([img1, sep, img2])
+    cv2.imwrite("demo_result.png", comparison)
+    print("[Demo] Saved demo_result.png")
+
+    # Debug aligned view
+    align_compare = np.hstack([aligned, swapped_aligned, source_aligned])
+    cv2.imwrite("debug_aligned_compare.png", align_compare)
+    print("[Demo] Saved debug_aligned_compare.png")
+    print("[Demo] Done!")
+
+
+# ---------------------------------------------------------------------------
+# Color transfer from AI source face
+# ---------------------------------------------------------------------------
+
+def _transfer_vivid_color(swapped, source_ref, strength=0.7):
+    """Transfer color from AI source face so skin looks vivid like the AI image."""
+    lab_swap = cv2.cvtColor(swapped, cv2.COLOR_BGR2Lab).astype(np.float64)
+    lab_src = cv2.cvtColor(source_ref, cv2.COLOR_BGR2Lab).astype(np.float64)
+
+    result = lab_swap.copy()
+    for c in range(3):
+        s_mean, s_std = lab_swap[:, :, c].mean(), max(lab_swap[:, :, c].std(), 1e-6)
+        t_mean, t_std = lab_src[:, :, c].mean(), max(lab_src[:, :, c].std(), 1e-6)
+        transferred = (lab_swap[:, :, c] - s_mean) * (t_std / s_std) + t_mean
+        result[:, :, c] = strength * transferred + (1.0 - strength) * lab_swap[:, :, c]
+
+    return cv2.cvtColor(np.clip(result, 0, 255).astype(np.uint8), cv2.COLOR_Lab2BGR)
+
+
+# ---------------------------------------------------------------------------
+# Boost saturation and brightness for vivid skin
+# ---------------------------------------------------------------------------
+
+def _boost_vivid(face_bgr, saturation=1.3, brightness=1.05):
+    """Increase saturation and brightness for vivid, lively skin appearance."""
+    hsv = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
+    hsv[:, :, 1] = np.clip(hsv[:, :, 1] * saturation, 0, 255)   # S channel
+    hsv[:, :, 2] = np.clip(hsv[:, :, 2] * brightness, 0, 255)   # V channel
+    return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+
+
+# ---------------------------------------------------------------------------
+# Full face skin smoothing
+# ---------------------------------------------------------------------------
+
+def _smooth_face(face_bgr, strength=0.55):
+    """Bilateral smoothing on full face for uniform beautiful skin."""
+    lab = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2Lab)
+    L = lab[:, :, 0].astype(np.float32)
+
+    L_u8 = np.clip(L, 0, 255).astype(np.uint8)
+    L_smooth = cv2.bilateralFilter(L_u8, d=12, sigmaColor=75, sigmaSpace=75).astype(np.float32)
+
+    try:
+        L_guided = cv2.ximgproc.guidedFilter(
+            guide=L_u8, src=L_smooth.astype(np.uint8), radius=10, eps=80
+        ).astype(np.float32)
+        L_smooth = 0.5 * L_smooth + 0.5 * L_guided
+    except AttributeError:
+        pass
+
+    L_out = strength * L_smooth + (1.0 - strength) * L
+
+    result_lab = lab.copy()
+    result_lab[:, :, 0] = np.clip(L_out, 0, 255).astype(np.uint8)
+
+    # Slight A/B smoothing for uniform skin color
+    for c in [1, 2]:
+        ch = lab[:, :, c].astype(np.float32)
+        ch_smooth = cv2.GaussianBlur(ch, (7, 7), 2.5)
+        result_lab[:, :, c] = np.clip(
+            0.2 * ch_smooth + 0.8 * ch, 0, 255
+        ).astype(np.uint8)
+
+    return cv2.cvtColor(result_lab, cv2.COLOR_Lab2BGR)
+
+
+# ---------------------------------------------------------------------------
+# CodeFormer
+# ---------------------------------------------------------------------------
+
+def _apply_codeformer(sess, face_bgr, fidelity=0.3):
+    """CodeFormer restoration for sharp, clear face details."""
+    h, w = face_bgr.shape[:2]
+
+    inp = cv2.resize(face_bgr, (512, 512), interpolation=cv2.INTER_LINEAR)
+    inp = inp[:, :, ::-1].astype(np.float32) / 255.0
+    inp = (inp - 0.5) / 0.5
+    inp = np.expand_dims(inp.transpose(2, 0, 1), 0)
+
+    inputs = sess.get_inputs()
+    feeds = {}
+    for i_node in inputs:
+        if i_node.shape and len(i_node.shape) == 4:
+            feeds[i_node.name] = inp
+        else:
+            dtype_str = i_node.type
+            if "double" in dtype_str:
+                feeds[i_node.name] = np.array([[fidelity]], dtype=np.float64)
+            else:
+                feeds[i_node.name] = np.array([[fidelity]], dtype=np.float32)
+
+    try:
+        out = sess.run(None, feeds)[0]
+    except Exception as e:
+        print(f"[Demo] CodeFormer failed: {e}")
+        return face_bgr
+
+    out = np.clip(out[0], -1, 1)
+    out = ((out + 1) / 2 * 255).round().astype(np.uint8)
+    out = out.transpose(1, 2, 0)[:, :, ::-1]
+    out = cv2.resize(out, (w, h), interpolation=cv2.INTER_LINEAR)
+
+    return cv2.addWeighted(out, 0.85, face_bgr, 0.15, 0)
+
+
+if __name__ == "__main__":
+    main()
